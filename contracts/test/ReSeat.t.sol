@@ -440,6 +440,11 @@ contract ReSeatTest is Test {
         vm.prank(address(proxy));
         vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
         workshop.settle(mei, 1);
+        vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
+        workshop.retryPayment(address(watcher), 1, 1);
+        vm.prank(address(proxy));
+        vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
+        workshop.retryPayment(mei, 1, 1);
         IReactive.LogRecord memory empty;
         vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
         watcher.react(empty);
@@ -792,6 +797,302 @@ contract ReSeatTest is Test {
             (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(first + i);
             assertEq(request.recipient, sources[i]);
         }
+    }
+
+    function testCronRetriesRecoveredTwoTicketPaymentOnce() public {
+        _join(linKey, 2, start, 2 * PRICE);
+        _refund(sellerA, 1);
+        _relayState();
+        vm.warp(block.timestamp + 120);
+        _tick();
+        assertEq(_settlements(), 0);
+        _refund(sellerB, 2);
+        _relayState();
+        token.setCollectionFailure(true);
+        _deliver(0);
+        _relayState();
+        assertEq(workshop.deferredHead(), 1);
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+        token.setCollectionFailure(false);
+        _deliver(0); // Replaying the original settlement cannot bypass the payment timer.
+        assertEq(workshop.ticketBalance(lin), 0);
+        uint256 due = block.timestamp + 30;
+        vm.warp(due - 1);
+        _tick();
+        assertEq(_settlements(), 1);
+        vm.warp(due);
+        _tick();
+        _tick();
+        assertEq(_settlements(), 2);
+        _deliver(1);
+        _relayState();
+        _deliver(1);
+        assertEq(workshop.ticketBalance(lin), 2);
+        assertEq(token.balanceOf(address(workshop)), 2 * PRICE);
+        assertEq(token.balanceOf(lin), 0);
+        assertFalse(watcher.cronActive());
+    }
+
+    function _refundBothAndDeliver() private {
+        _refund(sellerA, 1);
+        _relayState();
+        uint256 index = system.requestCount();
+        _refund(sellerB, 2);
+        _relayState();
+        vm.recordLogs();
+        system.deliver(index, proxy);
+        _relayState();
+    }
+
+    function _deferFirstBuyer(uint256 deadline) private {
+        _join(linKey, 2, deadline, 2 * PRICE);
+        _join(meiKey, 1, start, PRICE);
+        // The token rejects this buyer's collection without reporting a revoked nonce or a low balance.
+        vm.mockCallRevert(
+            address(token), abi.encodeWithSelector(token.receiveWithAuthorization.selector, lin), "offline"
+        );
+        _refundBothAndDeliver();
+    }
+
+    function _exhaustPaymentRetries() private {
+        uint256[3] memory delays = [uint256(30), 60, 120];
+        for (uint8 i; i < delays.length; ++i) {
+            uint256 index = _settlements();
+            uint256 due = block.timestamp + delays[i];
+            assertEq(watcher.sourceState(address(workshop)).paymentRetryAt, due);
+            vm.warp(due - 1);
+            _tick();
+            assertEq(_settlements(), index);
+            vm.warp(due);
+            _tick();
+            _tick();
+            assertEq(_settlements(), index + 1);
+            (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(requestOffset + index);
+            assertEq(request.payload, abi.encodeCall(ISettlement.retryPayment, (address(0), 1, i + 1)));
+            vm.expectEmit(true, false, false, true, address(workshop));
+            emit EventWaitlist.PaymentDeferred(1);
+            _deliver(index);
+            _relayState();
+            _deliver(index); // Duplicate delivery cannot spend a second attempt.
+            _relayState();
+            assertEq(watcher.sourceState(address(workshop)).paymentAttempts, i + 1);
+            assertEq(workshop.deferredHead(), 1);
+            assertEq(workshop.availableSpots(), 2);
+            assertEq(token.balanceOf(lin), 2 * PRICE);
+        }
+        assertEq(watcher.sourceState(address(workshop)).paymentRetryAt, 0);
+        assertTrue(watcher.cronActive());
+    }
+
+    function testThreeFailedPaymentRetriesStillReleaseToNextBuyerAtDeadline() public {
+        uint256 deadline = block.timestamp + 15 minutes;
+        _deferFirstBuyer(deadline);
+        _exhaustPaymentRetries();
+        vm.warp(deadline - 1);
+        _tick();
+        assertEq(_settlements(), 4);
+        vm.warp(deadline);
+        _tick();
+        _deliver(4);
+        _relayState();
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Expired));
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+        assertEq(workshop.ticketBalance(mei), 1);
+        assertEq(token.balanceOf(mei), 0);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testPaymentRetryDueAtDeadlineYieldsToExpiry() public {
+        uint256 deadline = block.timestamp + 90;
+        _deferFirstBuyer(deadline);
+        vm.warp(deadline - 60);
+        _tick();
+        _deliver(1);
+        _relayState();
+        assertEq(watcher.sourceState(address(workshop)).paymentRetryAt, 0);
+        assertEq(watcher.sourceState(address(workshop)).paymentAttempts, 1);
+        vm.warp(deadline);
+        _tick();
+        (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(requestOffset + 2);
+        assertEq(request.payload, abi.encodeCall(ISettlement.settle, (address(0), 1)));
+        _deliver(2);
+        _relayState();
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Expired));
+        assertEq(workshop.ticketBalance(mei), 1);
+    }
+
+    function testManualRecoveryRemainsAvailableAfterThreeFailedAttempts() public {
+        _deferFirstBuyer(start);
+        // Use the public replay once before the first automatic attempt.
+        vm.recordLogs();
+        workshop.requestSettlementRetry();
+        _relayState();
+        _deliver(1);
+        _relayState();
+        _exhaustPaymentRetries();
+        vm.clearMockedCalls();
+        vm.warp(block.timestamp + 1 hours);
+        _tick();
+        uint256 index = _settlements();
+        assertEq(index, 5);
+        assertTrue(workshop.canRetrySettlement());
+        vm.recordLogs();
+        workshop.requestSettlementRetry();
+        _relayState();
+        assertEq(watcher.sourceState(address(workshop)).paymentAttempts, 3);
+        _deliver(index);
+        _relayState();
+        assertEq(workshop.ticketBalance(lin), 2);
+        assertEq(token.balanceOf(lin), 0);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testLatePaymentRetryDoesNotUseNextHeadsBudget() public {
+        _deferFirstBuyer(start);
+        vm.warp(block.timestamp + 30);
+        _tick(); // The payment callback for order 1 is in flight.
+        token.setCollectionFailure(true);
+        vm.recordLogs();
+        vm.prank(lin);
+        workshop.cancel(1);
+        _relayState();
+        _deliver(2);
+        _relayState();
+        assertEq(workshop.deferredHead(), 2);
+        token.setCollectionFailure(false);
+        _deliver(1);
+        _relayState();
+        assertEq(watcher.sourceState(address(workshop)).paymentAttempts, 0);
+        assertEq(token.balanceOf(mei), PRICE);
+        assertEq(workshop.ticketBalance(mei), 0);
+        vm.warp(block.timestamp + 30);
+        _tick();
+        _deliver(3);
+        _relayState();
+        assertEq(workshop.ticketBalance(mei), 1);
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+    }
+
+    function testEarlyPaymentDeliveryWaitsForBaseAndLaterAttemptCanRecover() public {
+        _deferFirstBuyer(start);
+        vm.clearMockedCalls();
+        uint256 due = block.timestamp + 30;
+        vm.warp(due);
+        _tick();
+        vm.warp(due - 1);
+        _deliver(1); // Lasna is ahead of Base.
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+        vm.warp(due + 59);
+        _tick();
+        assertEq(_settlements(), 2);
+        vm.warp(due + 60);
+        _tick();
+        _deliver(2); // No Base acknowledgement of the first attempt was needed.
+        _relayState();
+        _deliver(1);
+        assertEq(workshop.ticketBalance(lin), 2);
+        assertEq(token.balanceOf(lin), 0);
+    }
+
+    function testPausedTokenOnlySchedulesPaymentForAFullHead() public {
+        _join(linKey, 2, start, 2 * PRICE);
+        _refund(sellerA, 1);
+        _relayState();
+        token.setPaused(true);
+        vm.recordLogs();
+        workshop.requestSettlementRetry();
+        _relayState();
+        assertEq(watcher.sourceState(address(workshop)).paymentRetryAt, 0);
+        (,, uint256 held,, bool blocked) = workshop.settlementState();
+        assertEq(held, 1);
+        assertFalse(blocked);
+        vm.warp(block.timestamp + 10 minutes);
+        _tick();
+        assertEq(_settlements(), 0);
+
+        token.setPaused(false);
+        _refund(sellerB, 2);
+        _relayState();
+        token.setPaused(true);
+        _deliver(0);
+        _relayState();
+        uint256 due = watcher.sourceState(address(workshop)).paymentRetryAt;
+        assertEq(due, block.timestamp + 30);
+        token.setPaused(false);
+        vm.warp(due);
+        _tick();
+        _deliver(1);
+        _relayState();
+        assertEq(workshop.ticketBalance(lin), 2);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testRevokedHeadIsSkippedWhenAutomaticPaymentArrives() public {
+        _deferFirstBuyer(start);
+        vm.warp(block.timestamp + 30);
+        _tick();
+        _revokeLin();
+        token.setPaused(true);
+        _deliver(1);
+        _relayState();
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.PaymentFailed));
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+        assertEq(workshop.deferredHead(), 2);
+        token.setPaused(false);
+        vm.warp(block.timestamp + 30);
+        _tick();
+        _deliver(2);
+        _relayState();
+        assertEq(workshop.ticketBalance(mei), 1);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testTwoEventsHaveIndependentPaymentRetryBudgets() public {
+        EventWaitlist a = workshop;
+        EventWaitlist b = _publish(mei, "Afternoon workshop", start + 1 days, 2, 3e6);
+        _activate(b);
+        token.setCollectionFailure(true);
+        _join(linKey, 2, start, 2 * PRICE);
+        _refundBothAndDeliver();
+        uint256 dueA = block.timestamp + 30;
+
+        vm.warp(block.timestamp + 10);
+        workshop = b;
+        _buy(sellerA);
+        _buy(sellerB);
+        _join(meiKey, 2, start, 6e6);
+        _refundBothAndDeliver();
+        uint256 index = system.requestCount();
+        vm.warp(dueA);
+        _tick();
+        assertEq(system.requestCount(), index + 1);
+        vm.recordLogs();
+        system.deliver(index, proxy);
+        _relay(_record(address(a), ISettlement.SettlementState.selector));
+        assertEq(watcher.sourceState(address(a)).paymentAttempts, 1);
+        assertEq(watcher.sourceState(address(b)).paymentAttempts, 0);
+        assertEq(watcher.sourceState(address(b)).paymentRetryAt, dueA + 10);
+
+        token.setCollectionFailure(false);
+        vm.warp(dueA + 10);
+        _tick();
+        vm.recordLogs();
+        system.deliver(index + 1, proxy);
+        _relayState();
+        assertEq(b.ticketBalance(mei), 2);
+        assertEq(token.balanceOf(address(b)), 6e6);
+        assertEq(a.ticketBalance(lin), 0);
+        assertEq(token.balanceOf(address(a)), 0);
+        assertTrue(watcher.cronActive());
+        vm.warp(dueA + 60);
+        _tick();
+        vm.recordLogs();
+        system.deliver(index + 2, proxy);
+        _relay(_record(address(a), ISettlement.SettlementState.selector));
+        assertEq(a.ticketBalance(lin), 2);
+        assertEq(token.balanceOf(address(a)), 2 * PRICE);
+        assertFalse(watcher.cronActive());
     }
 
     function testDeferredPaymentStillExpiresAndReleasesSeat() public {

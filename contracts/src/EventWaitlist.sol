@@ -3,7 +3,7 @@ pragma solidity ^0.8.29;
 
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
-import {ISettlement, EventDetails} from "./interfaces/ISettlement.sol";
+import {ISettlement, EventDetails, PaymentRetries} from "./interfaces/ISettlement.sol";
 import {IUSDC} from "./interfaces/IUSDC.sol";
 import {TicketBook} from "./TicketBook.sol";
 
@@ -47,7 +47,9 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         address buyer;
         uint32 qty;
         Status status;
+        uint8 lastPaymentAttempt;
         uint256 deadline;
+        uint256 paymentRetryAt;
         Signature auth;
     }
 
@@ -176,7 +178,7 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         ) revert InvalidAuthorization();
         nonceRegistered[msg.sender][auth.nonce] = true;
         id = nextId++;
-        orders[id] = Order(msg.sender, qty, Status.Queued, deadline, auth);
+        orders[id] = Order(msg.sender, qty, Status.Queued, 0, deadline, 0, auth);
         ++activeOrders;
         emit Queued(id, msg.sender, qty, deadline);
     }
@@ -194,11 +196,6 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     function _step(Order storage order) private view returns (Step) {
         if (order.status == Status.Cancelled) return Step.Cancelled;
         if (block.timestamp >= order.deadline) return Step.Expire;
-        try usdc.paused() returns (bool paused) {
-            if (paused) return Step.Unavailable;
-        } catch {
-            return Step.Unavailable;
-        }
         try usdc.authorizationState(order.buyer, order.auth.nonce) returns (bool spent) {
             if (spent) return Step.PersonalFailure;
         } catch {
@@ -209,7 +206,12 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         } catch {
             return Step.Unavailable;
         }
-        return availableSpots < order.qty ? Step.Hold : Step.Fill;
+        if (availableSpots < order.qty) return Step.Hold;
+        try usdc.paused() returns (bool paused) {
+            return paused ? Step.Unavailable : Step.Fill;
+        } catch {
+            return Step.Unavailable;
+        }
     }
 
     function settlementState()
@@ -220,8 +222,9 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         if (headId >= nextId || availableSpots == 0) return (0, 0, 0, false, false);
         Order storage order = orders[headId];
         Step step = _step(order);
-        paymentBlocked = step == Step.Unavailable || (step == Step.Fill && deferredHead == headId);
-        ready = step != Step.Hold && !paymentBlocked;
+        bool unavailable = step == Step.Unavailable;
+        paymentBlocked = (unavailable && availableSpots >= order.qty) || (step == Step.Fill && deferredHead == headId);
+        ready = step != Step.Hold && !unavailable && !paymentBlocked;
         return (
             headId,
             order.deadline,
@@ -236,6 +239,34 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         onlyServiceProvider
         onlyCallbackSender(reactive_)
     {
+        _settle(expectedHeadId);
+    }
+
+    function retryPayment(address reactive_, uint256 expectedHeadId, uint8 attempt)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(reactive_)
+    {
+        Order storage order = orders[expectedHeadId];
+        if (
+            expectedHeadId != headId || deferredHead != headId || order.status != Status.Queued
+                || availableSpots < order.qty || order.paymentRetryAt == 0 || attempt <= order.lastPaymentAttempt
+                || attempt > PaymentRetries.LIMIT
+        ) {
+            _report(Report.Echo);
+            return;
+        }
+        if (block.timestamp < order.paymentRetryAt) return;
+        if (block.timestamp < order.deadline) {
+            // Consume this delivery before entering the same payment checks as a normal settlement.
+            order.lastPaymentAttempt = attempt;
+            order.paymentRetryAt = 0;
+            deferredHead = 0;
+        }
+        _settle(expectedHeadId);
+    }
+
+    function _settle(uint256 expectedHeadId) private {
         if (!automationReady) revert BindingPending();
         if (headId != expectedHeadId || headId >= nextId || availableSpots == 0) {
             _report(Report.Echo); // An old CRON can repair a missed terminal state. Lasna discards duplicate revisions.
@@ -282,6 +313,7 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
 
     function _resolve(uint256 id, Status status) private {
         if (deferredHead == id) deferredHead = 0;
+        orders[id].paymentRetryAt = 0;
         orders[id].status = status;
         --activeOrders;
         emit OrderResolved(id, status);
@@ -289,20 +321,35 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
 
     function _report(Report mode) private {
         (uint256 head, uint256 deadline, uint256 held, bool ready, bool blocked) = settlementState();
-        bytes32 snapshot = keccak256(abi.encode(head, deadline, held, ready, blocked, availableSpots));
+        uint256 retryAt;
+        if (head != 0) {
+            Order storage order = orders[head];
+            if (blocked) {
+                deferredHead = head;
+                if (order.paymentRetryAt == 0) {
+                    order.paymentRetryAt = PaymentRetries.nextAt(block.timestamp, order.lastPaymentAttempt, deadline);
+                }
+                retryAt = order.paymentRetryAt;
+            } else {
+                order.paymentRetryAt = 0;
+            }
+        }
+        bytes32 snapshot = keccak256(abi.encode(head, deadline, held, ready, blocked, availableSpots, retryAt));
         if (snapshot != lastReport || mode == Report.Retry) {
             lastReport = snapshot;
             ++revision;
         } else if (mode == Report.Changed) {
             return;
         }
-        emit SettlementState(revision, head, deadline, held, ready, availableSpots);
+        emit SettlementState(revision, head, deadline, held, ready, availableSpots, retryAt);
     }
 
     function _retryState() private view returns (bytes32 key, Step step, bool allowed) {
         if (availableSpots == 0 || headId >= nextId || activeOrders == 0) return (0, Step.Hold, false);
         step = _step(orders[headId]);
-        key = keccak256(abi.encode(headId, availableSpots, step, deferredHead == headId));
+        key = keccak256(
+            abi.encode(headId, availableSpots, step, deferredHead == headId, orders[headId].lastPaymentAttempt)
+        );
         allowed = !retried[key];
     }
 

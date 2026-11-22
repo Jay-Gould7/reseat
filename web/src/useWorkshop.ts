@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { networks, readBase, readLasna, type Chain, type TicketCursor } from "./chain";
-import { createLedger, type Entry } from "./ledger";
+import { createLedger } from "./ledger";
 
 export const signalConfirmation = () => window.dispatchEvent(new Event("reseat:confirmed"));
 
@@ -41,13 +41,14 @@ export function usePolling<T>(load: (stale: () => boolean) => Promise<T>) {
 
 function useHistory(chain: Chain, source: string) {
   const index = useMemo(() => createLedger(chain, source), [chain, source]);
-  const [entries, setEntries] = useState<Entry[]>([]);
+  const [syncing, setSyncing] = useState(false);
   const read = useCallback(async (stale: () => boolean) => {
-    await index(rows => { if (!stale()) setEntries(rows); }, stale);
-    return true;
+    const rows = await index(() => { if (!stale()) setSyncing(true); }, stale);
+    if (!stale()) setSyncing(false);
+    return rows;
   }, [index]);
   const { data, error } = usePolling(read);
-  return { entries, error, syncing: Boolean(networks[chain].address && !data && !error) };
+  return { entries: data ?? [], error, syncing: Boolean(networks[chain].address && !error && (syncing || !data)) };
 }
 
 export function useWorkshop(source: string, account: string, cursor: TicketCursor) {

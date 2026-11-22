@@ -14,18 +14,22 @@ interface Props {
   busy: boolean;
   errors: string[];
   syncing: boolean;
+  orderHistory: "loading" | "ready" | "unavailable";
   cancel: (id: string) => void;
   retry: () => void;
 }
 
-export function Activity({ event, watcher, bound, base, lasna, now, account, busy, errors, syncing, cancel, retry }: Props) {
+export function Activity({ event, watcher, bound, base, lasna, now, account, busy, errors, syncing, orderHistory, cancel, retry }: Props) {
   const [allOrders, setAllOrders] = useState(false);
   const [filter, setFilter] = useState<"all" | Chain>("all");
   const [orderLimit, setOrderLimit] = useState(5);
   const [logLimit, setLogLimit] = useState(6);
   const orders = useMemo(() => ordersFrom(base), [base]);
-  const ranks = useMemo(() => new Map(orders.filter(o => o.status === 1 && o.deadline > now).map((o, i) => [o.id, i + 1])), [orders, now]);
-  const visible = orders.filter(o => allOrders || o.status === 1);
+  const open = useMemo(() => orders.filter(order => order.status === 1 && now < order.deadline), [orders, now]);
+  const ranks = useMemo(() => new Map(open.map((order, i) => [order.id, i + 1])), [open]);
+  const visible = allOrders ? orders : open;
+  const historyMessage = orderHistory === "loading" ? "Reading orders…" :
+    orderHistory === "unavailable" ? "Order history unavailable" : "";
   const logs = useMemo(() => [...base, ...lasna].sort((a, b) => b.time - a.time ||
     (a.chain === b.chain ? b.block - a.block || b.index - a.index : a.chain.localeCompare(b.chain)))
     .filter(row => filter === "all" || row.chain === filter), [base, lasna, filter]);
@@ -33,7 +37,7 @@ export function Activity({ event, watcher, bound, base, lasna, now, account, bus
   return <>
     <section className="panel queue" id="waitlist" aria-labelledby="queue-title">
       <div className="section-heading"><div className="heading-icon"><ListOrdered size={20} /><h2 id="queue-title">Waitlist</h2></div>
-        <span className="count-label">{event ? event.active + " open" : "FIFO"}</span></div>
+        <span className="count-label" role="status">{historyMessage || open.length + " open"}</span></div>
       <div className="metric-grid">
         <div><Armchair size={17} /><span>{localText("Public seats", "可售票数")}</span><strong>{event?.publicSeats ?? "—"} <small>/ {event?.capacity ?? "—"}</small></strong></div>
         <div><Clock3 size={17} /><span>{localText("Held seats", "已暂留")}</span><strong>{event?.held ?? "—"}</strong></div>
@@ -43,21 +47,24 @@ export function Activity({ event, watcher, bound, base, lasna, now, account, bus
         localText("Payment delayed. The head order keeps its place and reserved seats.", "收款暂时中断。队首顺位和暂留票已保留。") :
         localText(`Holding ${event.held} ${event.held === 1 ? "seat" : "seats"} · ${event.headQty - event.held} more needed. No USDC charged.`,
           `已暂留 ${event.held} 张，还差 ${event.headQty - event.held} 张，尚未扣款`)}</p>}
+      {matches && watcher.active && watcher.paymentRetryAt > 0 && <p className="inline-note">
+        {localText("Next automatic payment retry", "下次自动重试收款")} · {formatTime(watcher.paymentRetryAt)}</p>}
       {matches && watcher.active && <p className="inline-note">Tracking the head deadline · {formatTime(watcher.deadline)}</p>}
       <div className="tabs" aria-label="Queue view">{["Open orders", "All orders"].map((s, i) =>
         <button key={s} aria-pressed={allOrders === Boolean(i)} onClick={() => { setAllOrders(Boolean(i)); setOrderLimit(5); }}>{s}</button>)}</div>
-      {!visible.length ? <div className="empty"><Layers3 size={21} /><div><strong>{syncing ? "Reading orders…" : "No confirmed orders"}</strong>
+      {historyMessage ? null : !visible.length ? <div className="empty"><Layers3 size={21} /><div><strong>
+        {allOrders ? "No confirmed orders" : "No open orders"}</strong>
         <p>Requests appear here in the order they join.</p></div></div> :
         <ol className="order-list">{visible.slice(0, orderLimit).map(o => <li key={o.id}>
           <span className="rank" aria-label="Queue position">{ranks.has(o.id) ? "#" + ranks.get(o.id) : "–"}</span>
           <div className="order-label"><strong>Order #{o.id} · {o.qty} {o.qty === 1 ? "ticket" : "tickets"}</strong>
             <small>{shortAddress(o.buyer)} · Until {formatTime(o.deadline)}</small></div>
-          <div className="order-state"><span className={"pill " + (o.status === 2 ? "pill-green" : "")}>{o.status === 1 && now >= o.deadline ?
-            "Deadline passed" : o.status >= 3 ? "Skipped · " + statusNames[o.status] : statusNames[o.status]}</span>
+          <div className="order-state"><span className={"pill " + (o.status === 2 ? "pill-green" : "")}>{o.status === 1 && !ranks.has(o.id) ?
+            localText("Deadline passed", "已过截止时间") : o.status === 3 ? localText("Skipped · Expired", "已确认过期") : o.status >= 3 ? "Skipped · " + statusNames[o.status] : statusNames[o.status]}</span>
             {o.status === 1 && o.buyer.toLowerCase() === account.toLowerCase() &&
               <button className="text-action" disabled={busy} onClick={() => cancel(o.id)}>Cancel order</button>}</div>
         </li>)}</ol>}
-      {visible.length > orderLimit && <button className="text-action" onClick={() => setOrderLimit(v => v + 10)}>Show more orders</button>}
+      {!historyMessage && visible.length > orderLimit && <button className="text-action" onClick={() => setOrderLimit(v => v + 10)}>Show more orders</button>}
       {event?.canRetry && <button className="retry" disabled={busy} onClick={retry}><Timer size={15} />Request settlement retry</button>}
     </section>
     <section className="panel activity" id="activity" aria-labelledby="activity-title">

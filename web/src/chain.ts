@@ -16,7 +16,7 @@ export const baseAbi = [
   "function details() view returns (" + detailsTuple + ")",
   "function capacity() view returns (uint32)", "function ticketPrice() view returns (uint256)",
   "function eventStartTime() view returns (uint256)", "function availableSpots() view returns (uint256)",
-  "function publicSpots() view returns (uint256)", "function activeOrders() view returns (uint256)",
+  "function publicSpots() view returns (uint256)",
   "function factory() view returns (address)", "function _CALLBACK_SENDER() view returns (address)",
   "function automationReady() view returns (bool)", "function organizer() view returns (address)",
   "function retainedProceeds() view returns (uint256)", "function ticketBalance(address) view returns (uint256)",
@@ -26,23 +26,24 @@ export const baseAbi = [
   "function orderInfo(uint256) view returns (address buyer,uint32 qty,uint256 deadline,uint8 status)",
   "function buy(uint32 qty)", "function refund(uint256 ticketId)",
   "function enqueue(uint32 qty,uint256 userDeadline,(bytes32 nonce,uint8 v,bytes32 r,bytes32 s) auth) returns (uint256)",
+  "function retryPayment(address reactive_,uint256 expectedHeadId,uint8 attempt)",
   "function cancel(uint256 id)", "function requestSettlementRetry()", "function withdrawProceeds()",
   "event TicketsIssued(uint256 indexed firstId,address indexed buyer,uint256 indexed orderId,uint32 qty)",
   "event TicketRefunded(uint256 indexed ticketId,address indexed buyer,uint256 amount)",
   "event Queued(uint256 indexed id,address indexed buyer,uint32 qty,uint256 deadline)",
   "event OrderResolved(uint256 indexed id,uint8 status)", "event PaymentDeferred(uint256 indexed id)",
   "event BindingConfirmed(address indexed watcher)",
-  "event SettlementState(uint256 indexed revision,uint256 headId,uint256 headEffectiveDeadline,uint256 heldSpots,bool ready,uint256 availableSpots)",
+  "event SettlementState(uint256 indexed revision,uint256 headId,uint256 headEffectiveDeadline,uint256 heldSpots,bool ready,uint256 availableSpots,uint256 paymentRetryAt)",
   "event ProceedsWithdrawn(address indexed organizer,uint256 amount)",
   ...["EventStarted","InvalidQuantity","SalesAvailable","SeatsUnavailable","InvalidAuthorization","NotTicketOwner",
     "NotOrderOwner","NotQueued","WithdrawalUnavailable","TokenTransferFailed","RetryUnavailable","BindingPending"].map(name => "error " + name + "()"),
 ];
 export const watcherAbi = [
   "function factory() view returns (address)",
-  "function sourceState(address) view returns ((bool registered,uint256 revision,uint256 head,uint256 deadline,uint256 available,uint256 slot,uint256 lastCronAt,uint256 lastAnnouncementAt))",
+  "function sourceState(address) view returns ((bool registered,uint256 revision,uint256 head,uint256 deadline,uint256 available,uint256 slot,uint256 lastCronAt,uint256 lastAnnouncementAt,uint256 paymentRetryAt,uint256 lastPaymentAt,uint8 paymentAttempts))",
   "event SourceBound(address indexed source)",
   "event CronChanged(address indexed source,bool active,uint256 headId,uint256 deadline,bool subscriptionChanged)",
-  "event SettlementRequested(address indexed source,uint256 indexed headId,bool fromCron,bytes32 indexed sourceTx)",
+  "event SettlementRequested(address indexed source,uint256 indexed headId,bool fromCron,bytes32 indexed sourceTx,uint8 paymentAttempt)",
 ];
 export const tokenAbi = [
   "function name() view returns (string)", "function version() view returns (string)", "function DOMAIN_SEPARATOR() view returns (bytes32)",
@@ -119,16 +120,16 @@ export async function readBase(source: string, account: string, cursor: TicketCu
   const binding = await readBaseBinding(rpc, source, block.number);
   const event = new Contract(source, baseAbi, rpc);
   const at = { blockTag: block.number };
-  const [metadata, capacity, price, start, available, publicSeats, active, state, page, count, organizer, proceeds, canRetry] = await Promise.all([
+  const [metadata, capacity, price, start, available, publicSeats, state, page, count, organizer, proceeds, canRetry] = await Promise.all([
     event.details(at), event.capacity(at), event.ticketPrice(at), event.eventStartTime(at), event.availableSpots(at),
-    event.publicSpots(at), event.activeOrders(at), event.settlementState(at),
+    event.publicSpots(at), event.settlementState(at),
     account ? event.ticketsPage(account, cursor.grant, cursor.offset, at) : null,
     account ? event.ticketBalance(account, at) : 0n, event.organizer(at), event.retainedProceeds(at), event.canRetrySettlement(at),
   ]);
   const headQty = state.head !== 0n ? Number((await event.orderInfo(state.head, at)).qty) : 0;
   return { block, event: { binding, name: String(metadata.name), location: String(metadata.location),
     description: String(metadata.description), cover: coverUrl(metadata.cover), capacity: Number(capacity), price: BigInt(price),
-    start: Number(start), available: Number(available), publicSeats: Number(publicSeats), active: Number(active),
+    start: Number(start), available: Number(available), publicSeats: Number(publicSeats),
     headQty, held: Number(state.heldSpots), blocked: Boolean(state.paymentBlocked), tickets: Array.from((page?.ids ?? []) as bigint[]),
     ticketCount: BigInt(count), nextPage: page?.more ? { grant: BigInt(page.nextGrant), offset: Number(page.nextOffset) } : null,
     account, canRetry: Boolean(canRetry), organizer: String(organizer), proceeds: BigInt(proceeds) } };
@@ -144,7 +145,7 @@ export async function readLasna(source: string) {
   const at = { blockTag: block.number };
   const [factory, state] = await Promise.all([contract.factory(at), contract.sourceState(source, at)]);
   return { address, source: getAddress(source), factory: String(factory), registered: Boolean(state.registered),
-    revision: BigInt(state.revision), active: state.slot !== 0n, deadline: Number(state.deadline) };
+    revision: BigInt(state.revision), active: state.slot !== 0n, deadline: Number(state.deadline), paymentRetryAt: Number(state.paymentRetryAt) };
 }
 
 export type Workshop = Awaited<ReturnType<typeof readBase>>["event"];

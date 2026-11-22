@@ -1,5 +1,5 @@
 import { zeroPadValue, type JsonRpcProvider, type LogDescription } from "ethers";
-import { contractAddress, networks, reader, type Chain } from "./chain";
+import { contractAddress, formatTime, networks, reader, type Chain } from "./chain";
 
 export interface Entry {
   chain: Chain;
@@ -63,7 +63,7 @@ export function createLedger(chain: Chain, source: string) {
   let checkpoint: { number: number; hash: string | null } | undefined;
   let entries: Entry[] = [];
   let span = 5000;
-  return async (publish: (entries: Entry[]) => void, stopped: () => boolean) => {
+  return async (onSync: () => void, stopped: () => boolean) => {
     if (!networks[chain].address) return entries;
     const address = chain === "lasna" ? contractAddress(chain) : source;
     const rpc = await reader(chain);
@@ -72,10 +72,10 @@ export function createLedger(chain: Chain, source: string) {
     if (checkpoint && (await rpc.getBlock(checkpoint.number))?.hash !== checkpoint.hash) {
       checkpoint = undefined;
       entries = [];
-      publish([]);
     }
     start ??= await firstBlock(rpc, chain, address, latest);
     let from = checkpoint ? checkpoint.number + 1 : start;
+    if (from <= target && !stopped()) onSync();
     while (from <= target && !stopped()) {
       const to = Math.min(target, from + span - 1);
       let logs;
@@ -109,7 +109,6 @@ export function createLedger(chain: Chain, source: string) {
       page.sort((a, b) => a.block - b.block || a.index - b.index);
       entries = entries.concat(page);
       checkpoint = { number: to, hash: endHash };
-      if (page.length) publish(entries);
       from = to + 1;
     }
     return entries;
@@ -125,12 +124,14 @@ export function describe(entry: Entry) {
     case "TicketRefunded": return `Ticket #${a.ticketId} refunded`;
     case "Queued": return `Order #${a.id} joined for ${a.qty} ${a.qty === 1n ? "seat" : "seats"}`;
     case "OrderResolved": return `Order #${a.id} · ${statusNames[Number(a.status)]}`;
-    case "SettlementState": return a.heldSpots > 0n ? `Holding ${a.heldSpots} ${a.heldSpots === 1n ? "seat" : "seats"} for order #${a.headId}` :
+    case "SettlementState": return a.paymentRetryAt > 0n ? `Order #${a.headId} eligible for payment retry at ${formatTime(Number(a.paymentRetryAt))}` :
+      a.heldSpots > 0n ? `Holding ${a.heldSpots} ${a.heldSpots === 1n ? "seat" : "seats"} for order #${a.headId}` :
       a.ready ? `Order #${a.headId} ready for settlement` : "Settlement complete · no seats held";
     case "SourceBound": return "Lasna subscribed to this event";
     case "CronChanged": return a.active ? `CRON tracking order #${a.headId}` :
       a.subscriptionChanged ? "CRON unsubscribed" : "Deadline tracking stopped for this event";
-    case "SettlementRequested": return `${a.fromCron ? "CRON" : "Lasna"} requested settlement for order #${a.headId}`;
+    case "SettlementRequested": return a.paymentAttempt > 0n ? `CRON requested payment retry ${a.paymentAttempt} for order #${a.headId}` :
+      `${a.fromCron ? "CRON" : "Lasna"} requested settlement for order #${a.headId}`;
     case "ProceedsWithdrawn": return "Organizer withdrew ticket proceeds";
     default: return entry.event.name;
   }

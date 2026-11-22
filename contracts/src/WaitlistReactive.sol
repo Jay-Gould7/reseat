@@ -3,7 +3,7 @@ pragma solidity ^0.8.29;
 
 import {AbstractReactive} from "@reactive/src/base/AbstractReactive.sol";
 import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
-import {ISettlement, IEventDirectory} from "./interfaces/ISettlement.sol";
+import {ISettlement, IEventDirectory, PaymentRetries} from "./interfaces/ISettlement.sol";
 
 contract WaitlistReactive is AbstractReactive {
     uint256 public constant BASE_CHAIN_ID = 84532;
@@ -22,6 +22,9 @@ contract WaitlistReactive is AbstractReactive {
         uint256 slot; // One-based position in the set of events waiting for a deadline.
         uint256 lastCronAt;
         uint256 lastAnnouncementAt;
+        uint256 paymentRetryAt;
+        uint256 lastPaymentAt;
+        uint8 paymentAttempts;
     }
     address public immutable owner = msg.sender;
     address public factory;
@@ -31,7 +34,9 @@ contract WaitlistReactive is AbstractReactive {
 
     event SourceBound(address indexed source);
     event CronChanged(address indexed source, bool active, uint256 headId, uint256 deadline, bool subscriptionChanged);
-    event SettlementRequested(address indexed source, uint256 indexed headId, bool fromCron, bytes32 indexed sourceTx);
+    event SettlementRequested(
+        address indexed source, uint256 indexed headId, bool fromCron, bytes32 indexed sourceTx, uint8 paymentAttempt
+    );
 
     function bindFactory(address source) external {
         require(msg.sender == owner && factory == address(0) && source != address(0), "Invalid binding");
@@ -63,8 +68,8 @@ contract WaitlistReactive is AbstractReactive {
             return;
         }
         state.revision = log_.topic1;
-        (uint256 head, uint256 deadline, uint256 held, bool ready, uint256 available) =
-            abi.decode(log_.data, (uint256, uint256, uint256, bool, uint256));
+        (uint256 head, uint256 deadline, uint256 held, bool ready, uint256 available, uint256 baseRetryAt) =
+            abi.decode(log_.data, (uint256, uint256, uint256, bool, uint256, uint256));
         bool track = held != 0;
         bool tracking = state.slot != 0;
         if (track != tracking) _track(source, state, track);
@@ -72,10 +77,17 @@ contract WaitlistReactive is AbstractReactive {
             bool subscriptionChanged = track != tracking && tracked.length == (track ? 1 : 0);
             emit CronChanged(source, track, head, deadline, subscriptionChanged);
         }
+        if (state.head != head) {
+            state.paymentAttempts = 0;
+            state.lastPaymentAt = 0;
+        }
+        // New reports for the same head cannot shorten the backoff or refill its dispatch budget.
+        uint256 earliest = PaymentRetries.nextAt(state.lastPaymentAt, state.paymentAttempts, deadline);
+        state.paymentRetryAt = baseRetryAt == 0 || earliest == 0 ? 0 : (baseRetryAt > earliest ? baseRetryAt : earliest);
         state.head = head;
         state.deadline = deadline;
         state.available = available;
-        if (ready) _settle(source, head, false, bytes32(log_.txHash));
+        if (ready) _settle(source, head, false, bytes32(log_.txHash), 0);
     }
 
     function _register(address source, uint256 announcedAt) private {
@@ -127,7 +139,14 @@ contract WaitlistReactive is AbstractReactive {
                     && (state.lastCronAt == 0 || block.timestamp >= state.lastCronAt + 15 seconds)
             ) {
                 state.lastCronAt = block.timestamp;
-                _settle(source, state.head, true, sourceTx);
+                _settle(source, state.head, true, sourceTx, 0);
+            } else if (
+                block.timestamp < state.deadline && state.paymentRetryAt != 0 && block.timestamp >= state.paymentRetryAt
+            ) {
+                uint8 attempt = ++state.paymentAttempts;
+                state.lastPaymentAt = block.timestamp;
+                state.paymentRetryAt = PaymentRetries.nextAt(block.timestamp, attempt, state.deadline);
+                _settle(source, state.head, true, sourceTx, attempt);
             }
         }
     }
@@ -138,9 +157,12 @@ contract WaitlistReactive is AbstractReactive {
         operation(chain, emitter, topic, REACTIVE_IGNORE, REACTIVE_IGNORE, REACTIVE_IGNORE);
     }
 
-    function _settle(address source, uint256 head, bool fromCron, bytes32 sourceTx) private {
-        _request(source, abi.encodeCall(ISettlement.settle, (address(0), head)));
-        emit SettlementRequested(source, head, fromCron, sourceTx);
+    function _settle(address source, uint256 head, bool fromCron, bytes32 sourceTx, uint8 attempt) private {
+        bytes memory payload = attempt == 0
+            ? abi.encodeCall(ISettlement.settle, (address(0), head))
+            : abi.encodeCall(ISettlement.retryPayment, (address(0), head, attempt));
+        _request(source, payload);
+        emit SettlementRequested(source, head, fromCron, sourceTx, attempt);
     }
 
     function _request(address source, bytes memory payload) private {

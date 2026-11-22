@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Signature, hexlify, randomBytes } from "ethers";
 import { chromium } from "playwright-core";
 import { createServer } from "vite";
 import { actor, freePort, mined, platform, walletPage, webRoot } from "./local.mjs";
 
-test("publish and share two independent events, activate, reserve and recover payment", { timeout: 240_000 }, async t => {
+async function openPlatform(t) {
   const p = await platform(t);
   const port = await freePort();
   const origin = "http://127.0.0.1:" + port;
@@ -15,6 +16,11 @@ test("publish and share two independent events, activate, reserve and recover pa
   await server.listen(); t.after(() => server.close());
   const browser = await chromium.launch({ headless: true, executablePath: process.env.RESEAT_BROWSER });
   t.after(() => browser.close());
+  return { p, server, browser, origin };
+}
+
+test("publish and share two independent events, activate, reserve and recover payment", { timeout: 240_000 }, async t => {
+  const { p, server, browser, origin } = await openPlatform(t);
   const newUser = async () => walletPage(browser, p, await actor(p.base.rpc), origin);
   const hostA = await newUser(), hostB = await newUser();
   const now = (await p.base.rpc.getBlock("latest")).timestamp;
@@ -125,10 +131,21 @@ test("publish and share two independent events, activate, reserve and recover pa
   await refund(hostA,a,"20");
   await mined(p.token.setCollectionFailure(true)); await p.deliver(pending,a.target); await p.relayStates(a);
   assert.equal(await a.headId(),1n); assert.equal(await p.token.balanceOf(lin.wallet.address),40_000_000n);
+  await lin.page.close();
   await mined(p.token.setCollectionFailure(false));
-  await refresh(lin.page); await lin.page.getByRole("button", {name:"Request settlement retry"}).click();
-  await lin.page.getByText("The latest settlement state was published.", {exact:true}).waitFor(); await p.relayStates(a);
-  await lin.page.close(); await p.deliver(pending+1n,a.target); await p.relayStates(a);
+  const due = Number((await p.watcher.sourceState(a.target)).paymentRetryAt);
+  assert.ok(due > (await p.base.rpc.getBlock("latest")).timestamp);
+  await p.base.rpc.send("evm_setNextBlockTimestamp", [due]);
+  await p.base.rpc.send("evm_mine", []);
+  await p.lasna.rpc.send("evm_setNextBlockTimestamp", [due]);
+  await mined(p.system.relay(p.watcher.target, {
+    chainId: 5318007, contractAddress: await p.watcher.CRON_EMITTER(), topic0: await p.watcher.CRON10(),
+    topic1: 0, topic2: 0, topic3: 0, data: "0x", blockNumber: 0, opCode: 1, blockHash: 0, txHash: 0, logIndex: 0
+  }));
+  assert.equal(await p.system.requestCount(), pending + 2n);
+  await p.deliver(pending + 1n, a.target);
+  await p.relayStates(a);
+  await p.deliver(pending + 1n, a.target);
   assert.equal(await a.ticketBalance(lin.wallet.address),2n); assert.equal(await p.token.balanceOf(lin.wallet.address),0n);
   assert.equal(await b.activeOrders(),1n); assert.equal(await b.availableSpots(),1n);
   assert.equal((await p.watcher.sourceState(b.target)).revision,bRevision); assert.equal(await p.watcher.cronActive(),true);
@@ -136,8 +153,83 @@ test("publish and share two independent events, activate, reserve and recover pa
   await refresh(mobile);
   await mobile.getByText("2 tickets issued to order #1 · first ID #3", {exact:true}).waitFor();
   await mobile.getByRole("button", {name:"Lasna",exact:true}).click();
+  await mobile.getByText("CRON requested payment retry 1 for order #1", {exact:true}).waitFor();
   await mobile.getByText("Deadline tracking stopped for this event", {exact:true}).first().waitFor();
   assert.equal(await mobile.getByText("CRON unsubscribed", {exact:true}).count(), 0);
   await mobile.goto(origin); await mobile.getByRole("heading",{name:"Morning Lab"}).waitFor();
   await mobile.getByRole("heading",{name:"Evening Studio"}).waitFor();
+});
+
+test("open queue uses Base time, complete history and all pages without a refund", { timeout: 90_000 }, async t => {
+  const { p, browser, origin } = await openPlatform(t);
+  const seller = await actor(p.base.rpc);
+  const buyerB = await actor(p.base.rpc);
+  const buyerC = await actor(p.base.rpc);
+  const price = 20_000_000n;
+  const deadline = (await p.base.rpc.getBlock("latest")).timestamp + 600;
+  const start = deadline + 3600;
+  await mined(p.factory.connect(seller).createEvent(["Queue test", "", "", ""], start, 1, price,
+    { value: await p.factory.callbackDeposit() }));
+  const event = p.event(await p.factory.events(0));
+  await p.relay((await p.factory.queryFilter(p.factory.filters.EventCreated()))[0]);
+  await p.deliver(0, event.target);
+  await p.relayStates(event);
+  await mined(p.token.mint(seller.address, price));
+  await mined(p.token.connect(seller).approve(event.target, price));
+  await mined(event.connect(seller).buy(1));
+  await mined(p.token.mint(buyerC.address, price));
+
+  const domain = { name: await p.token.name(), version: await p.token.version(), verifyingContract: p.token.target, chainId: 84532 };
+  const types = { ReceiveWithAuthorization: [
+    { name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" }
+  ] };
+  for (let i = 0; i < 7; i++) {
+    const buyer = i === 1 ? buyerC : buyerB;
+    const validBefore = i === 1 ? start : deadline;
+    const nonce = hexlify(randomBytes(32));
+    const sig = Signature.from(await buyer.signTypedData(domain, types,
+      { from: buyer.address, to: event.target, value: price, validAfter: 0, validBefore, nonce }));
+    await mined(event.connect(buyer).enqueue(1, validBefore, [nonce, sig.v, sig.r, sig.s]));
+  }
+  await p.base.rpc.send("anvil_mine", ["0x3"]);
+  const page = await browser.newPage({ locale: "zh-CN" });
+  page.setDefaultTimeout(7000);
+  let releaseHistory;
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  t.after(() => releaseHistory());
+  await page.route(p.base.url + "/**", async route => {
+    if (route.request().postDataJSON()?.method === "eth_getLogs") await historyGate;
+    await route.continue();
+  });
+  await page.goto(origin + "/?event=" + event.target);
+  const queue = page.locator("#waitlist");
+  const rows = queue.locator(".order-list li");
+  await queue.getByText("Reading orders…", { exact: true }).waitFor();
+  assert.equal(await queue.locator(".count-label").innerText(), "Reading orders…");
+  assert.equal(await rows.count(), 0);
+  releaseHistory();
+  await queue.getByText("7 open", { exact: true }).waitFor();
+  assert.equal(await rows.count(), 5);
+  await p.base.rpc.send("evm_setNextBlockTimestamp", [deadline]);
+  await p.base.rpc.send("evm_mine", []);
+  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+  await queue.getByText("1 open", { exact: true }).waitFor();
+  assert.equal(await rows.count(), 1);
+  assert.match(await rows.first().innerText(), /Order #2/);
+  assert.equal(await rows.first().getByLabel("Queue position").textContent(), "#1");
+  assert.equal(await event.activeOrders(), 7n);
+  await queue.getByRole("button", { name: "All orders" }).click();
+  const rowB = rows.filter({ hasText: "Order #1 ·" });
+  await rowB.getByText("已过截止时间", { exact: true }).waitFor();
+  assert.equal(await rowB.getByLabel("Queue position").textContent(), "–");
+
+  // A later refund gives Base a reason to resolve the expired head on-chain.
+  await mined(event.connect(seller).refund(1));
+  await p.relayStates(event);
+  await p.deliver(1, event.target);
+  await p.base.rpc.send("anvil_mine", ["0x3"]);
+  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+  await rowB.getByText("已确认过期", { exact: true }).waitFor();
+  assert.equal(await event.ticketBalance(buyerC.address), 1n);
 });

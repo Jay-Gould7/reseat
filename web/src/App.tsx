@@ -64,6 +64,7 @@ function EventPage({ source, account, busy, connect, run, notify }: Session & { 
     <div className="content-grid"><div className="event-content">
       {event.description && <section className="about"><h2>About this event</h2><p className="event-description">{event.description}</p></section>}
       <Activity event={event} watcher={watcher} bound={ready} base={baseHistory.entries} lasna={lasnaHistory.entries} now={now} account={account}
+        orderHistory={baseHistory.error || base.error ? "unavailable" : baseHistory.syncing ? "loading" : "ready"}
         busy={busy} errors={historyErrors} syncing={baseHistory.syncing || lasnaHistory.syncing} cancel={id => action("cancel", "Your waitlist order was cancelled.", id)}
         retry={() => action("requestSettlementRetry", "The latest settlement state was published.")} />
     </div><Registration event={event} now={now} account={account} busy={busy} readError={Boolean(base.error)} binding={binding}
