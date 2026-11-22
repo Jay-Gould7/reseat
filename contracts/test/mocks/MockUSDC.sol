@@ -4,6 +4,17 @@ pragma solidity ^0.8.29;
 import {IUSDC} from "../../src/interfaces/IUSDC.sol";
 
 contract MockUSDC is IUSDC {
+    bool public paused;
+    bool public failCollection;
+
+    function setPaused(bool value) external {
+        paused = value;
+    }
+
+    function setCollectionFailure(bool value) external {
+        failCollection = value;
+    }
+
     string public constant name = "USDC";
     string public constant version = "2";
     uint8 public constant decimals = 6;
@@ -61,6 +72,7 @@ contract MockUSDC is IUSDC {
         bytes32 r,
         bytes32 s
     ) external {
+        require(!failCollection, "Temporary collection failure");
         require(to == msg.sender, "Payee only");
         require(block.timestamp > validAfter && block.timestamp < validBefore, "Outside authorization window");
         bytes32 body =
@@ -90,6 +102,7 @@ contract MockUSDC is IUSDC {
     }
 
     function _transfer(address from, address to, uint256 value) private {
+        require(!paused, "Token paused");
         require(to != address(0) && balanceOf[from] >= value, "Invalid transfer");
         balanceOf[from] -= value;
         balanceOf[to] += value;

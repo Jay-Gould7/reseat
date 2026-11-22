@@ -63,6 +63,12 @@ contract MockReactiveSystem is ISystemContract {
 }
 
 contract MockCallbackProxy {
+    mapping(address => uint256) public reserves;
+
+    function depositTo(address target) external payable {
+        reserves[target] += msg.value;
+    }
+
     function forward(address target, bytes memory payload, address sender, uint64 gasLimit) external {
         require(sender != address(0) && payload.length >= 36, "Invalid request");
         // Skip the bytes length and the four-byte selector to overwrite the reserved ABI word.

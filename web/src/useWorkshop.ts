@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { networks, readBase, readLasna, type Chain } from "./chain";
+import { networks, readBase, readLasna, type Chain, type TicketCursor } from "./chain";
 import { createLedger, type Entry } from "./ledger";
 
 export const signalConfirmation = () => window.dispatchEvent(new Event("reseat:confirmed"));
@@ -9,7 +9,7 @@ function message(error: unknown) {
   return "The public RPC is unavailable. Retrying automatically.";
 }
 
-function usePolling<T>(load: (stale: () => boolean) => Promise<T>) {
+export function usePolling<T>(load: (stale: () => boolean) => Promise<T>) {
   const [data, setData] = useState<T>();
   const [error, setError] = useState("");
   useEffect(() => {
@@ -39,8 +39,8 @@ function usePolling<T>(load: (stale: () => boolean) => Promise<T>) {
   return { data, error };
 }
 
-function useHistory(chain: Chain) {
-  const index = useMemo(() => createLedger(chain), [chain]);
+function useHistory(chain: Chain, source: string) {
+  const index = useMemo(() => createLedger(chain, source), [chain, source]);
   const [entries, setEntries] = useState<Entry[]>([]);
   const read = useCallback(async (stale: () => boolean) => {
     await index(rows => { if (!stale()) setEntries(rows); }, stale);
@@ -50,11 +50,12 @@ function useHistory(chain: Chain) {
   return { entries, error, syncing: Boolean(networks[chain].address && !data && !error) };
 }
 
-export function useWorkshop(account: string) {
-  const loadBase = useCallback(() => readBase(account), [account]);
+export function useWorkshop(source: string, account: string, cursor: TicketCursor) {
+  const loadBase = useCallback(() => readBase(source, account, cursor), [source, account, cursor]);
   const base = usePolling(loadBase);
-  const lasna = usePolling(readLasna);
-  const baseHistory = useHistory("base");
-  const lasnaHistory = useHistory("lasna");
+  const loadLasna = useCallback(() => readLasna(source), [source]);
+  const lasna = usePolling(loadLasna);
+  const baseHistory = useHistory("base", source);
+  const lasnaHistory = useHistory("lasna", source);
   return { base, lasna, baseHistory, lasnaHistory };
 }

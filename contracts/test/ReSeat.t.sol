@@ -7,7 +7,9 @@ import {AbstractPayer} from "@reactive/src/base/AbstractPayer.sol";
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IReactive} from "@reactive/src/interfaces/IReactive.sol";
 import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
-import {ISettlement} from "../src/interfaces/ISettlement.sol";
+import {EventFactory} from "../src/EventFactory.sol";
+import {TicketBook} from "../src/TicketBook.sol";
+import {IEventDirectory, EventDetails, ISettlement} from "../src/interfaces/ISettlement.sol";
 import {EventWaitlist} from "../src/EventWaitlist.sol";
 import {WaitlistReactive} from "../src/WaitlistReactive.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
@@ -24,6 +26,9 @@ contract ReSeatTest is Test {
     MockUSDC token;
     WaitlistReactive watcher;
     EventWaitlist workshop;
+    EventFactory factory;
+    uint256 requestOffset;
+    uint256 constant RESERVE = 0.001 ether;
     address sellerA;
     address sellerB;
     address lin;
@@ -40,13 +45,16 @@ contract ReSeatTest is Test {
         watcher = new WaitlistReactive();
         vm.chainId(BASE);
         proxy = new MockCallbackProxy();
-        workshop = new EventWaitlist(address(proxy), address(watcher));
+        factory = new EventFactory(address(proxy), address(watcher), RESERVE);
+        vm.chainId(LASNA);
+        watcher.bindFactory(address(factory));
+        vm.chainId(BASE);
+        workshop = _publish(address(this), "Reactive Builders Workshop", block.timestamp + 7 days, 2, PRICE);
+        _activate(workshop);
+        requestOffset = system.requestCount();
         token = MockUSDC(address(workshop.usdc()));
         vm.etch(address(token), type(MockUSDC).runtimeCode);
         start = workshop.eventStartTime();
-        vm.chainId(LASNA);
-        watcher.bindEvent(address(workshop));
-        vm.chainId(BASE);
         (lin, linKey) = makeAddrAndKey("Lin");
         (mei, meiKey) = makeAddrAndKey("Mei");
         sellerA = makeAddr("first holder");
@@ -55,15 +63,43 @@ contract ReSeatTest is Test {
         _buy(sellerB);
     }
 
+    function _publish(address host, string memory name, uint256 date, uint32 seats, uint256 price)
+        private
+        returns (EventWaitlist)
+    {
+        vm.deal(host, RESERVE);
+        vm.recordLogs();
+        vm.prank(host);
+        address source = factory.createEvent{value: RESERVE}(
+            EventDetails(name, "Shanghai", "Onchain workshop", ""), date, seats, price
+        );
+        return EventWaitlist(payable(source));
+    }
+
+    function _activate(EventWaitlist target) private {
+        IReactive.LogRecord memory created = _record(address(factory), IEventDirectory.EventCreated.selector);
+        assertEq(address(uint160(created.topic1)), address(target));
+        uint256 callbackIndex = system.requestCount();
+        _relay(created);
+        vm.recordLogs();
+        system.deliver(callbackIndex, proxy);
+        _relay(_record(address(target), ISettlement.SettlementState.selector));
+    }
+
+    function _settlements() private view returns (uint256) {
+        return system.requestCount() - requestOffset;
+    }
+
     function _buy(address buyer) private {
-        token.mint(buyer, PRICE);
+        uint256 price = workshop.ticketPrice();
+        token.mint(buyer, price);
         vm.startPrank(buyer);
-        token.approve(address(workshop), PRICE);
+        token.approve(address(workshop), price);
         workshop.buy(1);
         vm.stopPrank();
     }
 
-    function _sign(uint256 key, uint8 qty, uint256 deadline, bytes32 nonce)
+    function _sign(uint256 key, uint32 qty, uint256 deadline, bytes32 nonce)
         private
         view
         returns (EventWaitlist.Signature memory sig)
@@ -73,7 +109,7 @@ contract ReSeatTest is Test {
                 token.RECEIVE_WITH_AUTHORIZATION_TYPEHASH(),
                 vm.addr(key),
                 address(workshop),
-                uint256(qty) * PRICE,
+                uint256(qty) * workshop.ticketPrice(),
                 uint256(0),
                 deadline,
                 nonce
@@ -83,10 +119,12 @@ contract ReSeatTest is Test {
         (sig.v, sig.r, sig.s) = vm.sign(key, keccak256(abi.encodePacked(hex"1901", token.DOMAIN_SEPARATOR(), body)));
     }
 
-    function _join(uint256 key, uint8 qty, uint256 until, uint256 balance) private returns (uint256 id) {
+    function _join(uint256 key, uint32 qty, uint256 until, uint256 balance) private returns (uint256 id) {
         address buyer = vm.addr(key);
         token.mint(buyer, balance);
-        EventWaitlist.Signature memory sig = _sign(key, qty, until < start ? until : start, bytes32(++nonceSeed));
+        EventWaitlist.Signature memory sig = _sign(
+            key, qty, until < workshop.eventStartTime() ? until : workshop.eventStartTime(), bytes32(++nonceSeed)
+        );
         vm.prank(buyer);
         id = workshop.enqueue(qty, until, sig);
     }
@@ -97,15 +135,20 @@ contract ReSeatTest is Test {
         workshop.refund(ticketId);
     }
 
-    function _stateRecord() private view returns (IReactive.LogRecord memory record) {
+    function _stateRecord() private view returns (IReactive.LogRecord memory) {
+        return _record(address(workshop), ISettlement.SettlementState.selector);
+    }
+
+    function _record(address emitter, bytes32 topic) private view returns (IReactive.LogRecord memory record) {
         Vm.Log[] memory logs = vm.getRecordedLogs();
         for (uint256 i; i < logs.length; ++i) {
             Vm.Log memory entry = logs[i];
-            if (entry.emitter == address(workshop) && entry.topics[0] == ISettlement.SettlementState.selector) {
+            if (entry.emitter == emitter && entry.topics[0] == topic) {
                 record.chainId = BASE;
                 record.contractAddress = entry.emitter;
                 record.topic0 = uint256(entry.topics[0]);
                 record.topic1 = uint256(entry.topics[1]);
+                if (entry.topics.length > 2) record.topic2 = uint256(entry.topics[2]);
                 record.opCode = entry.topics.length;
                 record.data = entry.data;
                 return record;
@@ -137,7 +180,7 @@ contract ReSeatTest is Test {
 
     function _deliver(uint256 index) private {
         vm.recordLogs();
-        system.deliver(index, proxy);
+        system.deliver(index + requestOffset, proxy);
     }
 
     function _status(uint256 id) private view returns (EventWaitlist.Status status) {
@@ -151,12 +194,12 @@ contract ReSeatTest is Test {
         IReactive.LogRecord memory held = _stateRecord();
         _relay(held);
         assertTrue(watcher.cronActive());
-        assertEq(watcher.trackedHeadId(), id);
-        assertEq(watcher.trackedHeadDeadline(), start);
-        (,, uint256 heldSpots,) = workshop.settlementState();
+        assertEq(watcher.sourceState(address(workshop)).head, id);
+        assertEq(watcher.sourceState(address(workshop)).deadline, start);
+        (,, uint256 heldSpots,,) = workshop.settlementState();
         assertEq(heldSpots, 1);
         assertEq(workshop.publicSpots(), 0);
-        assertEq(system.requestCount(), 0);
+        assertEq(_settlements(), 0);
         assertEq(token.balanceOf(lin), 2 * PRICE);
         assertEq(token.balanceOf(sellerA), PRICE);
         assertEq(workshop.ticketOwner(1), address(0));
@@ -165,15 +208,15 @@ contract ReSeatTest is Test {
         workshop.buy(1);
         _refund(sellerB, 2);
         _relayState();
-        assertEq(system.requestCount(), 1);
-        (ISystemContract.CallbackConfiguration_V_1_0 memory request, address sender) = system.requestAt(0);
+        assertEq(_settlements(), 1);
+        (ISystemContract.CallbackConfiguration_V_1_0 memory request, address sender) = system.requestAt(requestOffset);
         assertEq(request.payload, abi.encodeCall(ISettlement.settle, (address(0), id)));
         assertEq(request.recipient, address(workshop));
         assertEq(sender, address(watcher));
         _deliver(0);
         _relayState();
         assertEq(token.balanceOf(lin), 0);
-        assertEq(workshop.ticketsOf(lin).length, 2);
+        assertEq(workshop.ticketBalance(lin), 2);
         assertEq(workshop.ticketOwner(3), lin);
         assertEq(workshop.ticketOwner(4), lin);
         assertEq(uint8(_status(id)), uint8(EventWaitlist.Status.Issued));
@@ -185,7 +228,7 @@ contract ReSeatTest is Test {
         assertFalse(watcher.cronActive());
         assertFalse(_tick());
         _deliver(0);
-        assertEq(workshop.ticketsOf(lin).length, 2);
+        assertEq(workshop.ticketBalance(lin), 2);
         assertEq(token.balanceOf(address(workshop)), 2 * PRICE);
     }
 
@@ -196,18 +239,18 @@ contract ReSeatTest is Test {
         _refund(sellerA, 1);
         _relayState();
         assertTrue(_tick());
-        assertEq(system.requestCount(), 0);
+        assertEq(_settlements(), 0);
         vm.warp(deadline + 1);
         assertTrue(_tick());
-        assertEq(system.requestCount(), 1);
+        assertEq(_settlements(), 1);
         _deliver(0);
         _relayState();
         assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Expired));
         assertEq(uint8(_status(2)), uint8(EventWaitlist.Status.Issued));
         assertEq(token.balanceOf(lin), 2 * PRICE);
         assertEq(token.balanceOf(mei), 0);
-        assertEq(workshop.ticketsOf(mei).length, 1);
-        assertEq(workshop.ticketsOf(lin).length, 0);
+        assertEq(workshop.ticketBalance(mei), 1);
+        assertEq(workshop.ticketBalance(lin), 0);
         assertFalse(watcher.cronActive());
         assertFalse(_tick());
         assertEq(system.removals(), 1);
@@ -226,10 +269,10 @@ contract ReSeatTest is Test {
         assertEq(workshop.headId(), 1);
         vm.warp(deadline + 14);
         _tick();
-        assertEq(system.requestCount(), 1);
+        assertEq(_settlements(), 1);
         vm.warp(deadline + 15);
         _tick();
-        assertEq(system.requestCount(), 2);
+        assertEq(_settlements(), 2);
         _deliver(1);
         _relayState();
         assertEq(workshop.publicSpots(), 1);
@@ -248,16 +291,16 @@ contract ReSeatTest is Test {
         _deliver(0);
         _relayState();
         assertTrue(watcher.cronActive());
-        assertEq(watcher.trackedHeadId(), 2);
-        assertEq(watcher.trackedHeadDeadline(), later);
-        assertEq(system.adds(), 2); // One source filter and one CRON filter.
+        assertEq(watcher.sourceState(address(workshop)).head, 2);
+        assertEq(watcher.sourceState(address(workshop)).deadline, later);
+        assertEq(system.adds(), 3); // Factory, event state, and shared CRON.
         assertEq(system.removals(), 0);
         vm.warp(later);
         _tick();
-        assertEq(system.requestCount(), 1);
+        assertEq(_settlements(), 1);
         vm.warp(early + 15);
         _tick();
-        assertEq(system.requestCount(), 2);
+        assertEq(_settlements(), 2);
         _deliver(1);
         _relayState();
         assertFalse(watcher.cronActive());
@@ -370,12 +413,12 @@ contract ReSeatTest is Test {
         assertEq(uint8(_status(6)), uint8(EventWaitlist.Status.Queued));
         assertEq(workshop.availableSpots(), 1);
         _relayState();
-        assertEq(system.requestCount(), 2);
+        assertEq(_settlements(), 2);
         _deliver(1);
         _relayState();
         assertEq(workshop.activeOrders(), 0);
         assertEq(workshop.ticketOwner(3), mei);
-        assertEq(system.requestCount(), 2);
+        assertEq(_settlements(), 2);
     }
 
     function testPublicRetryRecoversLostEventButCannotSettleDirectly() public {
@@ -384,7 +427,7 @@ contract ReSeatTest is Test {
         vm.recordLogs();
         vm.prank(mei);
         workshop.requestSettlementRetry();
-        assertEq(workshop.ticketsOf(lin).length, 0);
+        assertEq(workshop.ticketBalance(lin), 0);
         assertEq(token.balanceOf(lin), PRICE);
         _relayState();
         _deliver(0);
@@ -401,7 +444,7 @@ contract ReSeatTest is Test {
         vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
         watcher.react(empty);
         vm.expectRevert("Invalid binding");
-        watcher.bindEvent(mei);
+        watcher.bindFactory(mei);
         workshop.coverDebt();
         watcher.coverDebt();
     }
@@ -428,11 +471,11 @@ contract ReSeatTest is Test {
 
     function testOnlyOwnerMayRefundAndEachTicketRefundsOnce() public {
         vm.prank(mei);
-        vm.expectRevert(EventWaitlist.NotTicketOwner.selector);
+        vm.expectRevert(TicketBook.NotTicketOwner.selector);
         workshop.refund(1);
         _refund(sellerA, 1);
         vm.prank(sellerA);
-        vm.expectRevert(EventWaitlist.NotTicketOwner.selector);
+        vm.expectRevert(TicketBook.NotTicketOwner.selector);
         workshop.refund(1);
         assertEq(token.balanceOf(sellerA), PRICE);
         assertEq(workshop.ticketOwner(1), address(0));
@@ -456,5 +499,371 @@ contract ReSeatTest is Test {
         vm.expectRevert("Used or cancelled");
         token.receiveWithAuthorization(lin, address(workshop), PRICE, 0, start, sig.nonce, sig.v, sig.r, sig.s);
         vm.stopPrank();
+    }
+
+    function testTwoPublishersIsolateFundsCallbacksAndSharedCron() public {
+        EventWaitlist a = workshop;
+        address hostB = makeAddr("host B");
+        uint256 bPrice = 7_500_000;
+        EventWaitlist b = _publish(hostB, "Evening studio", start + 1 days, 3, bPrice);
+        _activate(b);
+        assertEq(a.organizer(), address(this));
+        assertEq(b.organizer(), hostB);
+        assertEq(b.details().name, "Evening studio");
+        assertEq(b.ticketPrice(), bPrice);
+        assertEq(b.eventStartTime(), start + 1 days);
+        assertEq(proxy.reserves(address(a)), RESERVE);
+        assertEq(proxy.reserves(address(b)), RESERVE);
+
+        _join(linKey, 2, start, 2 * PRICE);
+        _refund(sellerA, 1);
+        _relayState();
+        workshop = b;
+        _buy(sellerA);
+        _buy(sellerB);
+        _buy(sellerA);
+        _join(meiKey, 3, start + 1 days, 3 * bPrice);
+        _refund(sellerB, 2);
+        _relayState();
+        assertTrue(watcher.sourceState(address(a)).slot != 0 && watcher.sourceState(address(b)).slot != 0);
+        uint256 bRevision = watcher.sourceState(address(b)).revision;
+        uint256 index = system.requestCount();
+
+        workshop = a;
+        _refund(sellerB, 2);
+        _relayState();
+        assertEq(system.requestCount(), index + 1);
+        (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(index);
+        assertEq(request.recipient, address(a));
+        vm.recordLogs();
+        system.deliver(index, proxy);
+        _relayState();
+        assertEq(a.ticketBalance(lin), 2);
+        assertEq(token.balanceOf(address(a)), 2 * PRICE);
+        assertEq(b.activeOrders(), 1);
+        assertEq(b.availableSpots(), 1);
+        assertEq(token.balanceOf(address(b)), 2 * bPrice);
+        assertEq(token.balanceOf(mei), 3 * bPrice);
+        assertEq(watcher.sourceState(address(b)).revision, bRevision);
+        assertTrue(watcher.sourceState(address(b)).slot != 0);
+        assertEq(watcher.sourceState(address(a)).slot, 0);
+        assertTrue(watcher.cronActive());
+        assertEq(system.removals(), 0);
+
+        vm.warp(b.eventStartTime());
+        _tick();
+        (request,) = system.requestAt(index + 1);
+        assertEq(request.recipient, address(b));
+        workshop = b;
+        vm.recordLogs();
+        system.deliver(index + 1, proxy);
+        _relayState();
+        assertFalse(watcher.cronActive());
+        assertEq(system.removals(), 1);
+        vm.prank(hostB);
+        b.withdrawProceeds();
+        assertEq(token.balanceOf(hostB), 2 * bPrice);
+        assertEq(token.balanceOf(address(a)), 2 * PRICE);
+    }
+
+    function _deferredRecovery(bool pauseToken) private {
+        _join(linKey, 1, start, PRICE);
+        _join(meiKey, 1, start, PRICE);
+        _refund(sellerA, 1);
+        _relayState();
+        if (pauseToken) token.setPaused(true);
+        else token.setCollectionFailure(true);
+        _deliver(0);
+        _relayState();
+        assertEq(workshop.headId(), 1);
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Queued));
+        assertEq(workshop.availableSpots(), 1);
+        assertEq(workshop.publicSpots(), 0);
+        assertEq(token.balanceOf(lin), PRICE);
+        assertEq(token.balanceOf(mei), PRICE);
+        assertFalse(token.authorizationState(lin, bytes32(uint256(1))));
+        assertEq(_settlements(), 1);
+        (,,, bool ready, bool blocked) = workshop.settlementState();
+        assertTrue(blocked && !ready);
+        token.setPaused(false);
+        token.setCollectionFailure(false);
+        vm.recordLogs();
+        vm.prank(mei);
+        workshop.requestSettlementRetry();
+        _relayState();
+        _deliver(1);
+        _relayState();
+        assertEq(workshop.ticketOwner(3), lin);
+        assertEq(token.balanceOf(lin), 0);
+        assertEq(token.balanceOf(mei), PRICE);
+        assertEq(workshop.headId(), 2);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testPausedUSDCResumesAtOriginalHead() public {
+        _deferredRecovery(true);
+    }
+
+    function testUnknownCollectionFailureResumesAtOriginalHead() public {
+        _deferredRecovery(false);
+    }
+
+    function _revokeLin() private {
+        bytes32 nonce = bytes32(uint256(1));
+        bytes32 body = keccak256(abi.encode(token.CANCEL_AUTHORIZATION_TYPEHASH(), lin, nonce));
+        (uint8 v, bytes32 r, bytes32 s) =
+            vm.sign(linKey, keccak256(abi.encodePacked(hex"1901", token.DOMAIN_SEPARATOR(), body)));
+        token.cancelAuthorization(lin, nonce, v, r, s);
+    }
+
+    function testRevokedTwoSeatHeadCannotHoldFirstRefund() public {
+        _join(linKey, 2, start, 2 * PRICE);
+        _join(meiKey, 1, start, PRICE);
+        _revokeLin();
+        _refund(sellerA, 1);
+        _relayState();
+        assertFalse(watcher.cronActive());
+        _deliver(0);
+        _relayState();
+        assertEq(workshop.ticketOwner(3), mei);
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.PaymentFailed));
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+    }
+
+    function testRevokedAfterHoldReleasesOnRecheck() public {
+        _join(linKey, 2, start, 2 * PRICE);
+        _join(meiKey, 1, start, PRICE);
+        _refund(sellerA, 1);
+        _relayState();
+        assertTrue(watcher.cronActive());
+        _revokeLin();
+        vm.recordLogs();
+        workshop.requestSettlementRetry();
+        _relayState();
+        _deliver(0);
+        _relayState();
+        assertEq(workshop.ticketOwner(3), mei);
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testPublicRetryCannotBillIdleOrReplayUnchangedState() public {
+        uint256 before = workshop.revision();
+        vm.expectRevert(EventWaitlist.RetryUnavailable.selector);
+        workshop.requestSettlementRetry();
+        _join(linKey, 2, start, 2 * PRICE);
+        vm.expectRevert(EventWaitlist.RetryUnavailable.selector);
+        workshop.requestSettlementRetry();
+        assertEq(workshop.revision(), before);
+        _refund(sellerA, 1); // Miss the natural event.
+        vm.recordLogs();
+        workshop.requestSettlementRetry();
+        _relayState();
+        assertTrue(watcher.cronActive());
+        uint256 heldRevision = workshop.revision();
+        vm.warp(block.timestamp + 1 hours);
+        vm.prank(mei);
+        vm.expectRevert(EventWaitlist.RetryUnavailable.selector);
+        workshop.requestSettlementRetry();
+        assertEq(workshop.revision(), heldRevision);
+        _refund(sellerB, 2);
+        _relayState();
+        _deliver(0);
+        _relayState();
+        vm.expectRevert(EventWaitlist.RetryUnavailable.selector);
+        workshop.requestSettlementRetry();
+    }
+
+    function testRegistrationAuthenticatesFactoryAndSnapshotsEarlierSales() public {
+        EventWaitlist pending = _publish(mei, "Meetup", start, 4, PRICE);
+        IReactive.LogRecord memory created = _record(address(factory), IEventDirectory.EventCreated.selector);
+        IReactive.LogRecord memory foreign = _copyRecord(created);
+        foreign.contractAddress = lin;
+        vm.chainId(LASNA);
+        vm.prank(SYSTEM);
+        watcher.react(foreign);
+        assertFalse(watcher.sourceState(address(pending)).registered);
+        vm.chainId(BASE);
+        workshop = pending;
+        _buy(sellerA);
+        EventWaitlist.Signature memory sig = _sign(linKey, 1, start, keccak256("pending"));
+        vm.prank(lin);
+        vm.expectRevert(EventWaitlist.BindingPending.selector);
+        pending.enqueue(1, start, sig);
+        _relay(created);
+        assertTrue(watcher.sourceState(address(pending)).registered);
+        assertFalse(pending.automationReady());
+        vm.prank(address(proxy));
+        vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
+        pending.confirmBinding(lin);
+        vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
+        pending.confirmBinding(address(watcher));
+        vm.recordLogs();
+        system.deliver(requestOffset, proxy);
+        _relayState();
+        assertTrue(pending.automationReady());
+        assertEq(watcher.sourceState(address(pending)).available, 3);
+        uint256 count = system.requestCount();
+        _relay(created);
+        assertEq(system.requestCount(), count);
+    }
+
+    function _copyRecord(IReactive.LogRecord memory original) private pure returns (IReactive.LogRecord memory) {
+        return abi.decode(abi.encode(original), (IReactive.LogRecord));
+    }
+
+    function testMissedFactoryAnnouncementRecoverableFromBase() public {
+        EventWaitlist pending = _publish(mei, "Late binding", start, 3, PRICE);
+        vm.warp(block.timestamp + 5 minutes);
+        vm.recordLogs();
+        vm.prank(mei);
+        factory.retryActivation(address(pending));
+        _activate(pending);
+        assertTrue(pending.automationReady());
+        vm.prank(mei);
+        vm.expectRevert("Activation cooling down");
+        factory.retryActivation(address(pending));
+    }
+
+    function testHostRecoversLostFirstSnapshotOnceFromBase() public {
+        EventWaitlist pending = _publish(mei, "Snapshot recovery", start, 3, PRICE);
+        _relay(_record(address(factory), IEventDirectory.EventCreated.selector));
+        uint256 first = system.requestCount() - 1;
+        system.deliver(first, proxy); // The first Base acknowledgement never reaches Lasna.
+        assertTrue(pending.automationReady());
+        assertEq(watcher.sourceState(address(pending)).revision, 0);
+
+        vm.warp(block.timestamp + 6 minutes);
+        vm.expectRevert("Activation unavailable");
+        factory.retryActivation(address(pending));
+        vm.recordLogs();
+        vm.prank(mei);
+        factory.retryActivation(address(pending));
+        _activate(pending);
+        assertEq(watcher.sourceState(address(pending)).revision, pending.revision());
+        vm.warp(block.timestamp + 6 minutes);
+        vm.prank(mei);
+        vm.expectRevert("Activation unavailable");
+        factory.retryActivation(address(pending));
+    }
+
+    function testDelayedFactoryLogsRecoverEvenWhenDeliveredTogether() public {
+        EventWaitlist pending = _publish(mei, "Delayed announcements", start, 4, PRICE);
+        IReactive.LogRecord memory original = _record(address(factory), IEventDirectory.EventCreated.selector);
+        vm.warp(block.timestamp + 5 minutes);
+        vm.recordLogs();
+        vm.prank(mei);
+        factory.retryActivation(address(pending));
+        IReactive.LogRecord memory recovery = _record(address(factory), IEventDirectory.EventCreated.selector);
+
+        uint256 before = system.requestCount();
+        _relay(original); // Its activation callback is lost.
+        _relay(recovery); // Lasna delivers the newer Base announcement at the same Lasna timestamp.
+        _relay(original);
+        _relay(recovery);
+        assertEq(system.requestCount(), before + 2);
+        vm.recordLogs();
+        system.deliver(before + 1, proxy);
+        _relay(_record(address(pending), ISettlement.SettlementState.selector));
+        assertTrue(pending.automationReady());
+        assertEq(watcher.sourceState(address(pending)).revision, pending.revision());
+    }
+
+    function testSharedCronRotatesThroughFiveDueEvents() public {
+        address[5] memory sources;
+        uint256 deadline = block.timestamp + 30 minutes;
+        for (uint256 i; i < sources.length; ++i) {
+            workshop = _publish(address(this), "Workshop", start, 2, PRICE);
+            sources[i] = address(workshop);
+            _activate(workshop);
+            _buy(sellerA);
+            _buy(sellerB);
+            _join(linKey, 2, deadline, 2 * PRICE);
+            _refund(sellerA, 1);
+            _relayState();
+        }
+        uint256 first = system.requestCount();
+        vm.warp(deadline);
+        assertTrue(_tick());
+        assertEq(system.requestCount(), first + 4);
+        assertTrue(_tick());
+        assertEq(system.requestCount(), first + 5);
+        for (uint256 i; i < sources.length; ++i) {
+            (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(first + i);
+            assertEq(request.recipient, sources[i]);
+        }
+    }
+
+    function testDeferredPaymentStillExpiresAndReleasesSeat() public {
+        uint256 deadline = block.timestamp + 30 minutes;
+        _join(linKey, 1, deadline, PRICE);
+        _join(meiKey, 1, start, PRICE);
+        _refund(sellerA, 1);
+        _relayState();
+        token.setCollectionFailure(true);
+        _deliver(0);
+        _relayState();
+        assertTrue(watcher.cronActive());
+
+        token.setCollectionFailure(false);
+        vm.warp(deadline);
+        assertTrue(_tick());
+        _deliver(1);
+        _relayState();
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Expired));
+        assertEq(token.balanceOf(lin), PRICE);
+        assertEq(workshop.ticketOwner(3), mei);
+        assertFalse(watcher.cronActive());
+    }
+
+    function testLargeGroupIssuesInOneCallbackAndIndividuallyRefunds() public {
+        workshop = _publish(mei, "Assembly", start, 300, 1);
+        _activate(workshop);
+        token.mint(sellerA, 300);
+        vm.startPrank(sellerA);
+        token.approve(address(workshop), 300);
+        workshop.buy(300);
+        vm.stopPrank();
+        _join(linKey, 300, start, 300);
+        vm.startPrank(sellerA);
+        for (uint256 id = 1; id < 300; ++id) {
+            workshop.refund(id);
+        }
+        vm.recordLogs();
+        workshop.refund(300);
+        vm.stopPrank();
+        uint256 index = system.requestCount();
+        _relayState();
+        system.deliver(index, proxy);
+        assertEq(workshop.ticketBalance(lin), 300);
+        assertEq(workshop.ticketOwner(301), lin);
+        assertEq(workshop.ticketOwner(600), lin);
+        vm.prank(lin);
+        workshop.refund(310);
+        assertEq(workshop.ticketOwner(310), address(0));
+        assertEq(workshop.ticketOwner(311), lin);
+        assertEq(workshop.ticketBalance(lin), 299);
+        (uint256[] memory ids, uint256 grant, uint32 offset, bool more) = workshop.ticketsPage(lin, 0, 0);
+        assertTrue(more);
+        assertEq(grant, 0);
+        assertEq(offset, 32);
+        assertEq(ids.length, 31);
+        assertEq(ids[9], 311);
+        (ids,,,) = workshop.ticketsPage(lin, grant, offset);
+        assertEq(ids[0], 333);
+    }
+
+    function testInvalidTermsAndMissingReserveCannotPublish() public {
+        vm.deal(address(this), 1 ether);
+        EventDetails memory info = EventDetails("Studio", "", "", "");
+        vm.expectRevert("Invalid event terms");
+        factory.createEvent{value: RESERVE}(info, block.timestamp, 1, PRICE);
+        vm.expectRevert("Invalid event terms");
+        factory.createEvent{value: RESERVE}(info, start, 0, PRICE);
+        vm.expectRevert("Invalid event terms");
+        factory.createEvent{value: RESERVE}(info, start, 1, 0);
+        vm.expectRevert("Incorrect callback reserve");
+        factory.createEvent(info, start, 1, PRICE);
+        assertEq(factory.eventCount(), 1);
     }
 }

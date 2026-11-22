@@ -3,14 +3,12 @@ pragma solidity ^0.8.29;
 
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
-import {ISettlement} from "./interfaces/ISettlement.sol";
+import {ISettlement, EventDetails} from "./interfaces/ISettlement.sol";
 import {IUSDC} from "./interfaces/IUSDC.sol";
+import {TicketBook} from "./TicketBook.sol";
 
-/// @notice A two-seat workshop. Admissions are individually numbered and bound to their buyer.
-contract EventWaitlist is AbstractCallback, ISettlement {
+contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     IUSDC public constant usdc = IUSDC(0x036CbD53842c5426634e7929541eC2318f3dCF7e);
-    uint256 public constant capacity = 2;
-    uint256 public constant ticketPrice = 20e6;
     uint256 public constant BATCH_LIMIT = 5;
     bytes32 private constant RECEIVE_TYPEHASH = keccak256(
         "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
@@ -24,6 +22,19 @@ contract EventWaitlist is AbstractCallback, ISettlement {
         Cancelled,
         PaymentFailed
     }
+    enum Step {
+        Hold,
+        Fill,
+        Expire,
+        Cancelled,
+        PersonalFailure,
+        Unavailable
+    }
+    enum Report {
+        Changed,
+        Retry,
+        Echo
+    }
 
     struct Signature {
         bytes32 nonce;
@@ -34,32 +45,36 @@ contract EventWaitlist is AbstractCallback, ISettlement {
 
     struct Order {
         address buyer;
-        uint8 qty;
+        uint32 qty;
         Status status;
         uint256 deadline;
         Signature auth;
     }
 
+    address public immutable factory;
     address public immutable organizer;
     uint256 public immutable eventStartTime;
-    uint256 public availableSpots = capacity;
+    uint32 public immutable capacity;
+    uint256 public immutable ticketPrice;
+    EventDetails private metadata;
+    bool public automationReady;
+    uint256 public availableSpots;
     uint256 public retainedProceeds;
     uint256 public headId = 1;
     uint256 public nextId = 1;
     uint256 public activeOrders;
     uint256 public revision;
-    uint256 public lastRetryAt;
-    uint256 private lastTicketId;
-
+    uint256 public deferredHead;
+    bytes32 private lastReport;
+    mapping(bytes32 => bool) private retried;
     mapping(uint256 => Order) private orders;
     mapping(address => mapping(bytes32 => bool)) public nonceRegistered;
-    mapping(uint256 => address) public ticketOwner;
-    mapping(address => uint256[]) private walletTickets;
 
-    event TicketIssued(uint256 indexed ticketId, address indexed buyer, uint256 indexed orderId);
+    event BindingConfirmed(address indexed watcher);
     event TicketRefunded(uint256 indexed ticketId, address indexed buyer, uint256 amount);
-    event Queued(uint256 indexed id, address indexed buyer, uint8 qty, uint256 deadline);
+    event Queued(uint256 indexed id, address indexed buyer, uint32 qty, uint256 deadline);
     event OrderResolved(uint256 indexed id, Status status);
+    event PaymentDeferred(uint256 indexed id);
     event ProceedsWithdrawn(address indexed organizer, uint256 amount);
 
     error EventStarted();
@@ -67,26 +82,54 @@ contract EventWaitlist is AbstractCallback, ISettlement {
     error SalesAvailable();
     error SeatsUnavailable();
     error InvalidAuthorization();
-    error NotTicketOwner();
     error NotOrderOwner();
     error NotQueued();
     error WithdrawalUnavailable();
     error TokenTransferFailed();
-    error RetryCoolingDown();
+    error RetryUnavailable();
+    error BindingPending();
 
-    constructor(address callbackProxy_, address callbackSender_)
-        AbstractCallback(IPayable(payable(callbackProxy_)), callbackSender_)
-    {
-        require(callbackProxy_ != address(0) && callbackSender_ != address(0), "Missing callback address");
-        organizer = msg.sender;
-        eventStartTime = block.timestamp + 7 days;
+    constructor(
+        address callbackProxy_,
+        address callbackSender_,
+        address organizer_,
+        EventDetails memory details_,
+        uint256 start_,
+        uint32 capacity_,
+        uint256 price_
+    ) AbstractCallback(IPayable(payable(callbackProxy_)), callbackSender_) {
+        require(
+            callbackProxy_ != address(0) && callbackSender_ != address(0) && organizer_ != address(0), "Missing address"
+        );
+        require(
+            bytes(details_.name).length != 0 && start_ > block.timestamp && capacity_ > 0 && price_ > 0
+                && price_ <= type(uint256).max / capacity_,
+            "Invalid event terms"
+        );
+        factory = msg.sender;
+        organizer = organizer_;
+        metadata = details_;
+        eventStartTime = start_;
+        capacity = capacity_;
+        availableSpots = capacity_;
+        ticketPrice = price_;
     }
 
-    function ticketsOf(address buyer) external view returns (uint256[] memory) {
-        return walletTickets[buyer];
+    function details() external view returns (EventDetails memory) {
+        return metadata;
     }
 
-    function orderInfo(uint256 id) external view returns (address buyer, uint8 qty, uint256 deadline, Status status) {
+    function confirmBinding(address reactive_) external onlyServiceProvider onlyCallbackSender(reactive_) {
+        if (!automationReady) {
+            automationReady = true;
+            emit BindingConfirmed(reactive_);
+        } else {
+            deferredHead = 0;
+        }
+        _report(Report.Retry);
+    }
+
+    function orderInfo(uint256 id) external view returns (address buyer, uint32 qty, uint256 deadline, Status status) {
         Order storage order = orders[id];
         return (order.buyer, order.qty, order.deadline, order.status);
     }
@@ -95,7 +138,7 @@ contract EventWaitlist is AbstractCallback, ISettlement {
         return activeOrders == 0 && block.timestamp < eventStartTime ? availableSpots : 0;
     }
 
-    function buy(uint8 qty) external {
+    function buy(uint32 qty) external {
         if (block.timestamp >= eventStartTime) revert EventStarted();
         if (qty == 0) revert InvalidQuantity();
         if (qty > publicSpots()) revert SeatsUnavailable();
@@ -105,35 +148,32 @@ contract EventWaitlist is AbstractCallback, ISettlement {
 
     function refund(uint256 ticketId) external {
         if (block.timestamp >= eventStartTime) revert EventStarted();
-        if (ticketOwner[ticketId] != msg.sender) revert NotTicketOwner();
-        delete ticketOwner[ticketId];
-        uint256[] storage owned = walletTickets[msg.sender];
-        // A wallet holds at most capacity tickets.
-        for (uint256 i; i < owned.length; ++i) {
-            if (owned[i] == ticketId) {
-                owned[i] = owned[owned.length - 1];
-                owned.pop();
-                break;
-            }
-        }
+        _burnTicket(ticketId, msg.sender);
         ++availableSpots;
         retainedProceeds -= ticketPrice;
         if (!usdc.transfer(msg.sender, ticketPrice)) revert TokenTransferFailed();
         emit TicketRefunded(ticketId, msg.sender, ticketPrice);
-        if (activeOrders != 0) _publishState();
+        if (activeOrders != 0) _report(Report.Changed);
     }
 
-    function enqueue(uint8 qty, uint256 userDeadline, Signature calldata auth) external returns (uint256 id) {
+    function enqueue(uint32 qty, uint256 userDeadline, Signature calldata auth) external returns (uint256 id) {
+        if (!automationReady) revert BindingPending();
         if (block.timestamp >= eventStartTime) revert EventStarted();
         if (qty == 0 || qty > capacity) revert InvalidQuantity();
         if (publicSpots() != 0) revert SalesAvailable();
         uint256 deadline = userDeadline < eventStartTime ? userDeadline : eventStartTime;
-        if (deadline <= block.timestamp || nonceRegistered[msg.sender][auth.nonce]) revert InvalidAuthorization();
+        if (
+            deadline <= block.timestamp || nonceRegistered[msg.sender][auth.nonce]
+                || usdc.authorizationState(msg.sender, auth.nonce)
+        ) revert InvalidAuthorization();
         bytes32 body = keccak256(
             abi.encode(RECEIVE_TYPEHASH, msg.sender, address(this), qty * ticketPrice, uint256(0), deadline, auth.nonce)
         );
         bytes32 digest = keccak256(abi.encodePacked(hex"1901", usdc.DOMAIN_SEPARATOR(), body));
-        if (ecrecover(digest, auth.v, auth.r, auth.s) != msg.sender) revert InvalidAuthorization();
+        if (
+            uint256(auth.s) > 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0
+                || ecrecover(digest, auth.v, auth.r, auth.s) != msg.sender
+        ) revert InvalidAuthorization();
         nonceRegistered[msg.sender][auth.nonce] = true;
         id = nextId++;
         orders[id] = Order(msg.sender, qty, Status.Queued, deadline, auth);
@@ -146,16 +186,49 @@ contract EventWaitlist is AbstractCallback, ISettlement {
         if (order.buyer != msg.sender) revert NotOrderOwner();
         if (order.status != Status.Queued) revert NotQueued();
         _resolve(id, Status.Cancelled);
-        // If everyone cancelled, subsequent purchases need no callback.
         if (activeOrders == 0) headId = nextId;
-        if (availableSpots != 0 && (id == headId || activeOrders == 0)) _publishState();
+        if (availableSpots != 0 && (id == headId || activeOrders == 0)) _report(Report.Changed);
     }
 
-    function settlementState() public view returns (uint256 head, uint256 deadline, uint256 heldSpots, bool ready) {
-        if (headId >= nextId || availableSpots == 0) return (0, 0, 0, false);
-        Order storage first = orders[headId];
-        ready = first.status == Status.Cancelled || block.timestamp >= first.deadline || availableSpots >= first.qty;
-        return (headId, first.deadline, ready ? 0 : availableSpots, ready);
+    /// @dev Classify by independently observable facts. A token-wide outage or unreadable token keeps priority.
+    function _step(Order storage order) private view returns (Step) {
+        if (order.status == Status.Cancelled) return Step.Cancelled;
+        if (block.timestamp >= order.deadline) return Step.Expire;
+        try usdc.paused() returns (bool paused) {
+            if (paused) return Step.Unavailable;
+        } catch {
+            return Step.Unavailable;
+        }
+        try usdc.authorizationState(order.buyer, order.auth.nonce) returns (bool spent) {
+            if (spent) return Step.PersonalFailure;
+        } catch {
+            return Step.Unavailable;
+        }
+        try usdc.balanceOf(order.buyer) returns (uint256 balance) {
+            if (balance < order.qty * ticketPrice) return Step.PersonalFailure;
+        } catch {
+            return Step.Unavailable;
+        }
+        return availableSpots < order.qty ? Step.Hold : Step.Fill;
+    }
+
+    function settlementState()
+        public
+        view
+        returns (uint256 head, uint256 deadline, uint256 heldSpots, bool ready, bool paymentBlocked)
+    {
+        if (headId >= nextId || availableSpots == 0) return (0, 0, 0, false, false);
+        Order storage order = orders[headId];
+        Step step = _step(order);
+        paymentBlocked = step == Step.Unavailable || (step == Step.Fill && deferredHead == headId);
+        ready = step != Step.Hold && !paymentBlocked;
+        return (
+            headId,
+            order.deadline,
+            ready ? 0 : (availableSpots < order.qty ? availableSpots : order.qty),
+            ready,
+            paymentBlocked
+        );
     }
 
     function settle(address reactive_, uint256 expectedHeadId)
@@ -163,69 +236,86 @@ contract EventWaitlist is AbstractCallback, ISettlement {
         onlyServiceProvider
         onlyCallbackSender(reactive_)
     {
-        (uint256 current,,, bool ready) = settlementState();
-        // Covers replay, an old head, and Lasna reaching a deadline ahead of Base.
-        if (!ready || current != expectedHeadId) return;
+        if (!automationReady) revert BindingPending();
+        if (headId != expectedHeadId || headId >= nextId || availableSpots == 0) {
+            _report(Report.Echo); // An old CRON can repair a missed terminal state. Lasna discards duplicate revisions.
+            return;
+        }
         for (uint256 i; i < BATCH_LIMIT && headId < nextId && availableSpots != 0; ++i) {
             Order storage order = orders[headId];
-            if (order.status == Status.Cancelled) {
-                // The cancellation already emitted its reason and decremented activeOrders.
-            } else if (block.timestamp >= order.deadline) {
+            Step step = _step(order);
+            if (step == Step.Hold || step == Step.Unavailable) break;
+            if (step == Step.Expire) {
                 _resolve(headId, Status.Expired);
-            } else if (availableSpots < order.qty) {
-                break;
-            } else {
-                _chargeAndIssue(headId, order);
+            } else if (step == Step.PersonalFailure) {
+                _resolve(headId, Status.PaymentFailed);
+            } else if (step == Step.Fill) {
+                if (deferredHead == headId || !_chargeAndIssue(headId, order)) break;
             }
+            // Cancelled entries already published their outcome and released their active count.
             ++headId;
         }
         if (activeOrders == 0) headId = nextId;
-        _publishState();
+        _report(Report.Changed);
     }
 
-    function _chargeAndIssue(uint256 id, Order storage order) private {
-        uint256 amount = order.qty * ticketPrice;
-        if (usdc.balanceOf(order.buyer) < amount) {
-            _resolve(id, Status.PaymentFailed);
-            return;
-        }
+    function _chargeAndIssue(uint256 id, Order storage order) private returns (bool) {
         Signature storage sig = order.auth;
         try usdc.receiveWithAuthorization(
-            order.buyer, address(this), amount, 0, order.deadline, sig.nonce, sig.v, sig.r, sig.s
+            order.buyer, address(this), order.qty * ticketPrice, 0, order.deadline, sig.nonce, sig.v, sig.r, sig.s
         ) {
             _issue(order.buyer, order.qty, id);
             _resolve(id, Status.Issued);
+            return true;
         } catch {
-            _resolve(id, Status.PaymentFailed);
+            deferredHead = id;
+            emit PaymentDeferred(id);
+            return false;
         }
     }
 
-    function _issue(address buyer, uint8 qty, uint256 orderId) private {
+    function _issue(address buyer, uint32 qty, uint256 orderId) private {
         availableSpots -= qty;
         retainedProceeds += qty * ticketPrice;
-        for (uint256 i; i < qty; ++i) {
-            uint256 ticketId = ++lastTicketId;
-            ticketOwner[ticketId] = buyer;
-            walletTickets[buyer].push(ticketId);
-            emit TicketIssued(ticketId, buyer, orderId);
-        }
+        _issueTickets(buyer, qty, orderId);
     }
 
     function _resolve(uint256 id, Status status) private {
+        if (deferredHead == id) deferredHead = 0;
         orders[id].status = status;
         --activeOrders;
         emit OrderResolved(id, status);
     }
 
-    function _publishState() private {
-        (uint256 head, uint256 deadline, uint256 held, bool ready) = settlementState();
-        emit SettlementState(++revision, head, deadline, held, ready);
+    function _report(Report mode) private {
+        (uint256 head, uint256 deadline, uint256 held, bool ready, bool blocked) = settlementState();
+        bytes32 snapshot = keccak256(abi.encode(head, deadline, held, ready, blocked, availableSpots));
+        if (snapshot != lastReport || mode == Report.Retry) {
+            lastReport = snapshot;
+            ++revision;
+        } else if (mode == Report.Changed) {
+            return;
+        }
+        emit SettlementState(revision, head, deadline, held, ready, availableSpots);
+    }
+
+    function _retryState() private view returns (bytes32 key, Step step, bool allowed) {
+        if (availableSpots == 0 || headId >= nextId || activeOrders == 0) return (0, Step.Hold, false);
+        step = _step(orders[headId]);
+        key = keccak256(abi.encode(headId, availableSpots, step, deferredHead == headId));
+        allowed = !retried[key];
+    }
+
+    function canRetrySettlement() external view returns (bool allowed) {
+        (,, allowed) = _retryState();
     }
 
     function requestSettlementRetry() external {
-        if (lastRetryAt != 0 && block.timestamp < lastRetryAt + 15 seconds) revert RetryCoolingDown();
-        lastRetryAt = block.timestamp;
-        _publishState();
+        (bytes32 key, Step step, bool allowed) = _retryState();
+        if (!allowed) revert RetryUnavailable();
+        retried[key] = true;
+        if (step == Step.Fill) deferredHead = 0;
+        _report(Report.Retry);
     }
 
     function coverDebt() external {

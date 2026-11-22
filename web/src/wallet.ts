@@ -1,7 +1,7 @@
 import { BrowserProvider, Contract, Signature, TypedDataEncoder, getAddress, hexlify, isError, randomBytes,
   type ContractTransactionResponse, type Eip1193Provider, type JsonRpcSigner } from "ethers";
 import { useEffect, useState } from "react";
-import { BASE, USDC, baseAbi, contractAddress, networks, tokenAbi } from "./chain";
+import { BASE, USDC, baseAbi, bindingStatus, contractAddress, factoryAbi, networks, readBaseBinding, readLasna, tokenAbi } from "./chain";
 
 interface Wallet extends Eip1193Provider {
   on?: (name: string, cb: (...args: unknown[]) => void) => void;
@@ -56,7 +56,7 @@ export async function baseSigner(account: string) {
   return provider.getSigner(account);
 }
 
-export const workshopWith = (signer: JsonRpcSigner) => new Contract(contractAddress("base"), baseAbi, signer);
+export const workshopWith = (source: string, signer: JsonRpcSigner) => new Contract(source, baseAbi, signer);
 export type Notify = (text: string, hash?: string) => void;
 
 export async function confirm(tx: ContractTransactionResponse, notify: Notify) {
@@ -71,21 +71,23 @@ export async function confirm(tx: ContractTransactionResponse, notify: Notify) {
   }
 }
 
-export async function buy(signer: JsonRpcSigner, qty: number, price: bigint, notify: Notify) {
+export async function buy(signer: JsonRpcSigner, source: string, qty: number, price: bigint, notify: Notify) {
   const token = new Contract(USDC, tokenAbi, signer);
-  const address = contractAddress("base");
+  const { source: address } = await readBaseBinding(signer.provider, source);
   const total = BigInt(qty) * price;
   if (await token.allowance(signer.address, address) < total) {
     notify("Approve the exact ticket total in your wallet.");
     await confirm(await token.approve(address, total), notify);
   }
   notify("Confirm the ticket purchase in your wallet.");
-  return confirm(await workshopWith(signer).buy(qty), notify);
+  return confirm(await workshopWith(source, signer).buy(qty), notify);
 }
 
-export async function join(signer: JsonRpcSigner, qty: number, userDeadline: number, notify: Notify) {
+export async function join(signer: JsonRpcSigner, source: string, qty: number, userDeadline: number, notify: Notify) {
   const token = new Contract(USDC, tokenAbi, signer);
-  const workshop = workshopWith(signer);
+  const [binding, watcher] = await Promise.all([readBaseBinding(signer.provider, source), readLasna(source)]);
+  if (bindingStatus(binding, watcher) !== "ready") throw new Error("The watcher binding for this event could not be confirmed.");
+  const workshop = workshopWith(source, signer);
   const [name, version, separator, price, start, block] = await Promise.all([
     token.name(), token.version(), token.DOMAIN_SEPARATOR(), workshop.ticketPrice(), workshop.eventStartTime(),
     signer.provider.getBlock("latest"),
@@ -100,7 +102,7 @@ export async function join(signer: JsonRpcSigner, qty: number, userDeadline: num
     { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" },
   ] };
   notify("Step 1 of 2 · Sign the exact USDC authorization.");
-  const sig = Signature.from(await signer.signTypedData(domain, fields, { from: signer.address, to: contractAddress("base"),
+  const sig = Signature.from(await signer.signTypedData(domain, fields, { from: signer.address, to: source,
     value: BigInt(qty) * price, validAfter: 0, validBefore, nonce }));
   notify("Step 2 of 2 · Confirm your waitlist entry on Base.");
   return confirm(await workshop.enqueue(qty, userDeadline, [nonce, sig.v, sig.r, sig.s]), notify);
@@ -114,10 +116,31 @@ export function walletError(err: unknown) {
     try { name = networks.base.abi.parseError(e.data)?.name; } catch { /* Non-contract wallet error. */ }
   }
   const errors: Record<string, string> = {
-    EventStarted: "The workshop has started.", SeatsUnavailable: "Availability changed. Check the latest seat count.",
+    EventStarted: "The event has started.", SeatsUnavailable: "Availability changed. Check the latest seat count.",
     SalesAvailable: "Public seats are available again.", InvalidAuthorization: "The authorization is invalid or expired.",
     NotQueued: "This order has already been resolved.", NotTicketOwner: "This ticket is no longer in your wallet.",
-    RetryCoolingDown: "Wait 15 seconds before requesting another retry.",
+    RetryUnavailable: "This state has no pending retry. Refresh to see the latest activity.",
+    BindingPending: "Waitlist activation is pending.",
   };
   return (name && errors[name]) || e.shortMessage || e.message || "The wallet request failed.";
+}
+export interface Publication { name: string; location: string; description: string; cover: string; start: number; capacity: number; price: bigint }
+
+export async function publish(signer: JsonRpcSigner, draft: Publication, fee: bigint, notify: Notify) {
+  const address = contractAddress("base");
+  const factory = new Contract(address, factoryAbi, signer);
+  const block = await signer.provider.getBlock("latest");
+  if (!block || draft.start <= block.timestamp) throw new Error("Choose a future start time.");
+  notify("Confirm publication and the event’s callback reserve in your wallet.");
+  const tx = await factory.createEvent([draft.name, draft.location, draft.description, draft.cover],
+    draft.start, draft.capacity, draft.price, { value: fee });
+  const hash = await confirm(tx, notify);
+  const receipt = await signer.provider.getTransactionReceipt(hash);
+  for (const log of receipt?.logs ?? []) {
+    if (log.address.toLowerCase() !== address.toLowerCase()) continue;
+    const created = factory.interface.parseLog(log);
+    if (created?.name === "EventCreated" && getAddress(created.args.organizer) === signer.address)
+      return getAddress(created.args.eventAddress);
+  }
+  throw new Error("Publication confirmed. Find the event in the directory.");
 }

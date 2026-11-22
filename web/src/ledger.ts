@@ -1,4 +1,4 @@
-import type { JsonRpcProvider, LogDescription } from "ethers";
+import { zeroPadValue, type JsonRpcProvider, type LogDescription } from "ethers";
 import { contractAddress, networks, reader, type Chain } from "./chain";
 
 export interface Entry {
@@ -58,14 +58,14 @@ async function firstBlock(rpc: JsonRpcProvider, chain: Chain, address: string, h
 }
 
 // One incremental index per chain. Keep the last confirmed checkpoint to detect reorgs.
-export function createLedger(chain: Chain) {
+export function createLedger(chain: Chain, source: string) {
   let start: number | undefined;
   let checkpoint: { number: number; hash: string | null } | undefined;
   let entries: Entry[] = [];
   let span = 5000;
   return async (publish: (entries: Entry[]) => void, stopped: () => boolean) => {
     if (!networks[chain].address) return entries;
-    const address = contractAddress(chain);
+    const address = chain === "lasna" ? contractAddress(chain) : source;
     const rpc = await reader(chain);
     const latest = await rpc.getBlockNumber();
     const target = Math.max(0, latest - (chain === "base" ? 2 : 1));
@@ -80,7 +80,8 @@ export function createLedger(chain: Chain) {
       const to = Math.min(target, from + span - 1);
       let logs;
       try {
-        logs = await rpc.getLogs({ address, fromBlock: from, toBlock: to });
+        logs = await rpc.getLogs({ address, fromBlock: from, toBlock: to,
+          topics: chain === "lasna" ? [null, zeroPadValue(source, 32)] : undefined });
       } catch (error) {
         const detail = JSON.stringify(error, (_, v) => typeof v === "bigint" ? String(v) : v) + " " + String(error);
         if (span <= 1 || !/range|too many|too large|limit exceeded|more than|exceed.*block|-32005/i.test(detail)) throw error;
@@ -118,14 +119,17 @@ export function createLedger(chain: Chain) {
 export function describe(entry: Entry) {
   const a = entry.event.args;
   switch (entry.event.name) {
-    case "TicketIssued": return a.orderId === 0n ? `Ticket #${a.ticketId} purchased` : `Ticket #${a.ticketId} issued to order #${a.orderId}`;
+    case "TicketsIssued": return `${a.qty} ${a.qty === 1n ? "ticket" : "tickets"} ${a.orderId === 0n ? "purchased" : "issued to order #" + a.orderId} · first ID #${a.firstId}`;
+    case "BindingConfirmed": return "Base confirmed the waitlist watcher";
+    case "PaymentDeferred": return `Payment delayed · order #${a.id} retains priority`;
     case "TicketRefunded": return `Ticket #${a.ticketId} refunded`;
     case "Queued": return `Order #${a.id} joined for ${a.qty} ${a.qty === 1n ? "seat" : "seats"}`;
     case "OrderResolved": return `Order #${a.id} · ${statusNames[Number(a.status)]}`;
-    case "SettlementState": return a.heldSpots > 0n ? `Holding ${a.heldSpots} seat for order #${a.headId}` :
+    case "SettlementState": return a.heldSpots > 0n ? `Holding ${a.heldSpots} ${a.heldSpots === 1n ? "seat" : "seats"} for order #${a.headId}` :
       a.ready ? `Order #${a.headId} ready for settlement` : "Settlement complete · no seats held";
-    case "SourceBound": return "Lasna subscribed to the workshop";
-    case "CronChanged": return a.active ? `CRON tracking order #${a.headId}` : "CRON unsubscribed";
+    case "SourceBound": return "Lasna subscribed to this event";
+    case "CronChanged": return a.active ? `CRON tracking order #${a.headId}` :
+      a.subscriptionChanged ? "CRON unsubscribed" : "Deadline tracking stopped for this event";
     case "SettlementRequested": return `${a.fromCron ? "CRON" : "Lasna"} requested settlement for order #${a.headId}`;
     case "ProceedsWithdrawn": return "Organizer withdrew ticket proceeds";
     default: return entry.event.name;

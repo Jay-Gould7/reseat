@@ -4,27 +4,33 @@
 
 [Luma Help Center · Waitlist](https://help.luma.com/p/waitlist)
 
-ReSeat lets a guest request two workshop tickets, set a deadline and close the page. A signed USDC authorization leaves the money in their wallet until the entire order can be filled. Built for the DoraHacks Reactive Omni Buildathon, track 2, **Set It and Forget It**.
+ReSeat lets an organizer publish a ticketed event on Base Sepolia. A guest can join the sold-out waitlist for a whole group, set a deadline and close the browser. USDC stays in the guest’s wallet until all requested seats can be issued together. Built for the DoraHacks Reactive Omni Buildathon, track 2, **Set It and Forget It**.
 
-## The workshop
+## Publish, share and attend
 
-**Reactive Builders Workshop** is an online testnet event with two admissions at 20 USDC each (6 decimals). Deploying the Base contract schedules the start exactly seven days later. Two initial purchases sell it out. Each admission has its own ID and wallet owner. A refund burns that ID and returns 20 USDC in the same transaction. The organizer can withdraw retained proceeds once the workshop starts.
+Open **Publish event** and choose the name, future start time, capacity and price in test USDC (up to six decimal places). The form displays its time zone. Location, description and a public HTTPS cover URL are optional. Two seats at 20 USDC each are editable form defaults. The publisher signs one Base transaction. Its receipt identifies the new event and opens its shareable `?event=<event-contract-address>` page.
 
-| Chain | Contract | Responsibility |
+The catalog and event pages read public RPCs. Guests opening the link on another device see the same Base-stored details, inventory, queue and source-filtered activity. Images are fetched from the published cover URL. Browsing, purchasing and refunding work during activation. **Automatic waitlist ready** appears once both chains agree on the binding. The app checks again immediately before requesting a waitlist signature.
+
+## Contracts and settlement
+
+| Network | Contract | Responsibility |
 | --- | --- | --- |
-| Base Sepolia · 84532 | `EventWaitlist` | Tickets, escrow, refunds, FIFO orders and atomic settlement |
-| Reactive Lasna · 5318007 | `WaitlistReactive` | Base state subscription, on-demand Cron10 and authenticated callback requests |
+| Base Sepolia · 84532 | `EventFactory` | Records each event, passes the publishing wallet as organizer, deposits its Base callback reserve and announces its address |
+| Base Sepolia | One `EventWaitlist` per event | Holds that event’s USDC, immutable terms, metadata, numbered non-transferable admissions and FIFO queue |
+| Reactive Lasna · 5318007 | Shared `WaitlistReactive` | Discovers events from the trusted factory, keeps independent revisions, heads and deadlines and sends each callback to its originating event |
 
-1. The guest signs Circle’s EIP-712 `ReceiveWithAuthorization` with the event as payee, the exact total, a random 32-byte nonce, `validAfter = 0` and `validBefore = min(userDeadline, eventStartTime)`. The guest then submits the order. Either a queued order or its USDC authorization can be cancelled before capture.
-2. A refund publishes the new Base state. One returned seat stays with a two-seat head. Public sales cannot take reserved seats. Lasna subscribes to Cron10 only while waiting on a partially filled order. Both operations share the same six filter arguments.
-3. Enough seats trigger an immediate callback. Otherwise the first eligible tick at or after the head deadline requests one, with a 15-second cooldown. Base checks its own timestamp, the head, inventory and balance. It catches failed ERC-3009 payments and advances up to five orders per callback. A ready state continues the batch. A partial state tracks the new deadline. An idle state removes CRON.
-4. Monotonic state revisions discard reordered Base logs. The expected head makes repeated callbacks harmless. An early tick from Lasna leaves the Base queue untouched and a later tick retries. With zero vacancies, expired orders need no timer and are skipped when a seat next becomes available.
+1. The watcher subscribes to the factory’s `EventCreated`. On discovery it subscribes to the child’s `SettlementState` and requests `confirmBinding` on that child. The Base callback authenticates both the proxy and watcher, then publishes a fresh inventory snapshot. This includes sales and refunds made before the subscription. The UI verifies factory membership, the configured watcher in both Base contracts, the watcher’s bound factory, registration for this exact event and receipt of a positive state revision on Lasna.
+2. A direct sale issues individually refundable ticket IDs. A refund burns the ID and returns its ticket price in one transaction. While the queue is active, public sales cannot take its seats. Only the publishing wallet can withdraw retained USDC after the event starts.
+3. A guest signs Circle’s EIP-712 `ReceiveWithAuthorization` for the event contract, exact group total, unique nonce and `validBefore = min(guestDeadline, eventStartTime)`, then submits the order. One returned seat for a two-seat head is held without a charge. With enough seats, an authenticated callback rechecks Base time, the authorization and balance, then captures USDC and issues the whole group atomically. A contiguous ticket-ID range keeps issuance gas independent of group size.
+4. Expiration, cancellation, a used/revoked authorization or insufficient funds release the head for the next guest. Each callback processes at most five queue entries. Remaining actionable work emits a new state. A paused token, unreadable token state or unknown collection error preserves the order’s priority and seats. Retry after service recovers. Guests’ deadlines continue to apply during an outage.
+5. Heads holding seats share one on-demand Cron10 subscription. The watcher checks up to four tracked events per tick in rotation and applies a 15-second per-event cooldown to due callbacks. Ending one event’s hold removes only that event. Ending the last hold unsubscribes the shared timer. Per-event revisions discard stale snapshots and callbacks recheck the expected head before charging. All deadlines use timestamps.
 
-The Omni system at `0x8888888888888888888888888888888888888888` manages subscriptions and accepts `requestCallbackV_1_0`. Cron10 logs originate at the protocol’s separate CRON emitter. The Base entry point checks both the proxy and its injected Lasna sender. [Reactive contracts](https://dev.reactive.network/reactive-contracts) · [Callback contracts](https://dev.reactive.network/callback-contracts)
+The Omni system at `0x8888888888888888888888888888888888888888` accepts `SYSTEM.requestCallbackV_1_0`. `react` uses `onlySystem`. Base entry points use `onlyServiceProvider` and `onlyCallbackSender`. [Reactive contracts](https://dev.reactive.network/reactive-contracts) · [Callback contracts](https://dev.reactive.network/callback-contracts)
 
-## Local development
+## Run locally
 
-Use Foundry with Solidity 0.8.29 and Node 22.12+ with npm. The commands below use Git Bash or a POSIX shell. On Windows, a local Foundry installation normally places its executables in `~/.foundry/bin`.
+Use Foundry with Solidity 0.8.29 and Node.js 22.12+ with npm. The commands use Git Bash or a POSIX shell. Make `forge` and `anvil` available on PATH.
 
 ```sh
 git submodule update --init
@@ -33,72 +39,73 @@ cp .env.example .env
 cd web
 npm install
 npm run build
+npx playwright-core install chromium
+npm test
 npm run dev
 ```
 
-Open the local URL printed by Vite. Anyone can browse. Public RPCs provide Base and Lasna block heights even before deployment. With contract addresses configured in the root `.env`, the same page reads seat inventory, queue history, CRON and explorer-linked transactions. Blank addresses show a deployment preview. The local web server and the app can be closed throughout settlement.
+For an existing Chromium installation, set `RESEAT_BROWSER` to its executable path and omit the browser download. The browser test starts two loopback Anvil chains and Vite with temporary wallets and local mocks. It exercises two organizers, sharing into a fresh mobile browser, binding, purchases, signed orders, refunds and recovery after a failed collection. The preceding Foundry run produces its required artifacts. The regular dev server uses the platform settings in the root `.env`.
 
-`web/` reads only `VITE_*` variables from the root environment. Put the two contract addresses and their deployment receipt block numbers in `.env`. Restart Vite or rebuild after changes. Without start blocks, the reader locates deployment with historical `eth_getCode`. Supply receipt blocks if your RPC lacks archive access. History reads bounded ranges, follows new blocks, and waits two Base blocks and one Lasna block before displaying events. Wallet writes use an injected EOA wallet on Base Sepolia.
+## Deploy the platform once
 
-## Deploy and fund the testnets
+Review `.env.example`. Set `LASNA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`, the Base callback proxy and Circle test USDC. Choose `BASE_EVENT_CALLBACK_WEI`, the initial per-event Base reserve. The example is 0.001 test ETH. Choose an amount against current callback costs. Keep `DEPLOYER_PRIVATE_KEY` in the local ignored environment. Only the `VITE_` settings go into the frontend bundle.
 
-Review the networks and addresses first. The commands below broadcast when you run them. Fill in a testnet-only `DEPLOYER_PRIVATE_KEY` locally and use the same deployer to bind the watcher. Source the updated file after each receipt.
+Run the following as the operator. Save real receipt addresses and deployment block numbers to the root `.env` and reload it at the indicated steps.
 
 ```sh
 cd contracts
 load_config() { set -a; . ../.env; set +a; }
 load_config
 
-# 1. Lasna. Save its address and receipt block as VITE_REACTIVE_ADDRESS and VITE_LASNA_START_BLOCK.
+# 1. Deploy on Lasna. Save VITE_REACTIVE_ADDRESS and VITE_LASNA_START_BLOCK.
 forge script script/01_DeployReactive.s.sol:DeployReactive --rpc-url "$LASNA_RPC_URL" --broadcast
 load_config
 
-# 2. Base. Save its address and receipt block as VITE_EVENT_ADDRESS and VITE_BASE_START_BLOCK.
-forge script script/02_DeployEvent.s.sol:DeployEvent --rpc-url "$BASE_SEPOLIA_RPC_URL" --broadcast
+# 2. Deploy the Base factory. Save VITE_FACTORY_ADDRESS and VITE_BASE_START_BLOCK.
+forge script script/02_DeployFactory.s.sol:DeployFactory --rpc-url "$BASE_SEPOLIA_RPC_URL" --broadcast
 load_config
 
-# 3. Lasna. Bind the Base event once and subscribe to SettlementState.
+# 3. Bind the factory once, using the Lasna watcher's owner.
 forge script script/03_BindSource.s.sol:BindSource --rpc-url "$LASNA_RPC_URL" --broadcast
 
-# 4. Print the two funding commands for review.
+# 4. Print the funding commands and review the amounts.
 forge script script/04_FundingCommands.s.sol:FundingCommands
 ```
 
-Step 4 prints `cast send --interactive` commands for `depositTo(address)` on the Lasna system (test REACT) and Base callback proxy (test ETH). Review the sample amounts, then fund both reserves before starting the demo. A reserve deposit first pays outstanding debt. Both contracts also expose `coverDebt()` for funds sent directly to their native balances. After restoring service, anyone can call `requestSettlementRetry()` on Base to republish the latest state. Settlement still goes through Lasna. [Funding and debt](https://dev.reactive.network/economy)
+Build the web app with the two platform addresses and their start blocks. The Base start block is the **factory deployment block**. Browser-safe public RPC overrides are `VITE_BASE_RPC_URL` and `VITE_LASNA_RPC_URL`. Later publications are discovered by address using the same web build. The static site supports share links without server-side routing.
 
-| Deployment | Address |
+**Funding.** The platform operator funds the Lasna watcher with test REACT for execution. The host pays Base gas and the factory’s exact ETH reserve in the publication transaction. The factory forwards the reserve with `depositTo(eventAddress)` on the Base callback proxy; each event has its own callback balance. Anyone can top up that event on the proxy. Use the event’s address from its factory receipt. The watcher and event expose `coverDebt()` for native funds sent directly to the contracts. Ticket USDC remains separate from the native fee reserves. [Reactive funding and debt](https://dev.reactive.network/economy)
+
+**Recovery.** A host can replay the factory announcement on Base after five minutes if activation stalls. After Base confirmation one additional replay can repair a lost initial snapshot. A guest can request settlement again when inventory and queued orders coexist. Each distinct head, inventory and observed payment state allows one public replay. Empty or repeatedly unchanged requests revert before emitting a new report. After restoring funding, the watcher owner can call `syncEvent(eventAddress)` on Lasna for a registered event when repeated deliveries have failed. Only authenticated callbacks can settle orders.
+
+## Testnet addresses and evidence
+
+| Contract | Address |
 | --- | --- |
-| Lasna · WaitlistReactive | Pending deployment |
-| Base Sepolia · EventWaitlist | Pending deployment |
-| Base Sepolia · callback proxy | `0x476F44b11F5C942c58f4c8E3d0300E5710743585` |
-| Base Sepolia · Circle test USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
+| Lasna watcher | Pending deployment |
+| Base Sepolia factory | Pending deployment |
+| Published demo event | Pending publication |
+| Base Sepolia callback proxy | `0x476F44b11F5C942c58f4c8E3d0300E5710743585` |
+| Base Sepolia Circle test USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
 
-[Reactive network addresses](https://dev.reactive.network/origins-and-destinations) · [Circle test USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses#testnet)
+[Reactive network addresses](https://dev.reactive.network/origins-and-destinations) · [Circle USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses#testnet)
 
-## Demo and transaction evidence
+For the deadline demo, sell both seats, queue one guest for two seats with a short deadline and a second guest for one seat with a later deadline. Refund one seat and close both guests’ pages. Verify the first guest keeps their USDC and the second receives the ticket. Returning both seats before the first deadline demonstrates whole-order capture instead.
 
-Buy one ticket from each of two wallets. Have Lin queue for two tickets with a short deadline and Mei queue for one with a later deadline. Return one ticket and close the buyers’ browsers. After Lin’s deadline, Mei receives the seat and Lin keeps all 40 USDC. In a fresh run, return both tickets before Lin’s deadline to demonstrate the 40 USDC whole-order fill.
-
-| Stage | Network / explorer | Transaction hash |
+| Evidence | Explorer | Transaction hash |
 | --- | --- | --- |
-| Refund creates a held seat | Base Sepolia / BaseScan | Pending live receipt |
-| CRON requests settlement at the head deadline | Lasna / Reactscan | Pending live receipt |
-| Callback skips Lin and issues Mei’s ticket | Base Sepolia / BaseScan | Pending live receipt |
-
-The activity feed also links the subsequent Lasna CRON unsubscription. Foundry tests relay actual Base event data through a filter-matching mock system and a sender-injecting mock proxy. They cover both demo paths, revocation, insufficient funds, cancellation, clock skew, retries, ordering, replay, withdrawal and bounded continuation.
+| Refund that creates a held seat | BaseScan · Base Sepolia | Pending live receipt |
+| Due CRON tick requests settlement for this event | Reactscan · Lasna | Pending live receipt |
+| Callback expires the head and issues the next order | BaseScan · Base Sepolia | Pending live receipt |
 
 ## Repository
 
 ```text
-contracts/
-  src/       EventWaitlist, WaitlistReactive and shared interfaces
-  test/      Foundry scenarios, MockUSDC, mock Omni system and proxy
-  script/    Numbered deployment and funding steps
-  lib/       Pinned upstream Git submodules
-web/
-  src/       React event page, ethers readers, event history and wallet actions
-  public/    Workshop poster
-AGENTS.md    Reactive Omni development rules
+contracts/src/      EventFactory, EventWaitlist, TicketBook, WaitlistReactive and interfaces
+contracts/test/     Foundry scenarios, mock Circle USDC, Omni system and callback proxy
+contracts/script/   Platform deployment, binding and funding commands
+web/src/            Catalog, publishing form, event page, wallet and public chain readers
+web/test/           Browser journey on two local chains
 ```
 
-ReSeat-authored code is released under the [MIT License](LICENSE). The upstream [reactive-lib-omni v0.1.0](https://github.com/Reactive-Network/reactive-lib-omni/tree/3ade0dcf1d27e67e5783ef807e73a1b9e0c0cce8) submodule retains its published `SPDX-License-Identifier: UNLICENSED` headers. forge-std and frontend packages retain their upstream licenses.
+ReSeat-authored code uses the [MIT License](LICENSE). The pinned [reactive-lib-omni v0.1.0](https://github.com/Reactive-Network/reactive-lib-omni/tree/3ade0dcf1d27e67e5783ef807e73a1b9e0c0cce8) retains its upstream `SPDX-License-Identifier: UNLICENSED` headers. forge-std and web dependencies retain their upstream licenses.
