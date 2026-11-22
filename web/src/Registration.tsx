@@ -52,9 +52,14 @@ export function Registration({ event, now, account, busy, readError, binding, cu
       </select><ChevronDown size={15} /></div>
       {until === "custom" && <input type="datetime-local" aria-label="Custom waitlist deadline in your local time" value={custom} onChange={e => setCustom(e.target.value)} />}
       <small className={invalidTime ? "problem" : ""}>{invalidTime ? "Choose a future date and time." : "Effective deadline · " + formatTime(effective)}</small>
+      <p id="waitlist-wallet-note" className="inline-note">{localText(
+        "Joining the waitlist currently requires an externally owned account (EOA), such as a standard MetaMask account.",
+        "候补目前支持普通钱包账户（EOA），例如 MetaMask 的标准账户。"
+      )}</p>
     </div>}
     <div className="total"><span>{joinQueue ? localText("Total if seated", "出票时整单扣款") : localText("Total", "整单金额")}</span><strong>{validQty ? usdc(price * BigInt(qty)) + " USDC" : "—"}</strong></div>
     <button type="button" className="primary" disabled={busy || started || pending || readError || !validQty || invalidTime}
+      aria-describedby={joinQueue && !started ? "waitlist-wallet-note" : undefined}
       onClick={() => !account ? onConnect() : onRegister(qty, effective, joinQueue)}>
       {!account ? <Wallet size={17} /> : <Ticket size={17} />}{label}</button>
     <p className="form-note"><LockKeyhole size={14} />{started ? "Ticket sales and refunds have ended." :

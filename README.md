@@ -12,6 +12,10 @@ Open **Publish event** and choose the name, future start time, capacity and pric
 
 The catalog and event pages read public RPCs. Guests opening the link on another device see the same Base-stored details, inventory, queue and source-filtered activity. Images are fetched from the published cover URL. Browsing, purchasing and refunding work during activation. **Automatic waitlist ready** appears once both chains agree on the binding. The app checks again immediately before requesting a waitlist signature. The open count, list and ranks use the full confirmed Base queue history and the latest Base block time. At the deadline an unsettled order moves to **All orders** with **Deadline passed**. A later Base settlement records **Expired**.
 
+Joining the waitlist currently requires an externally owned account (EOA), such as a standard MetaMask account.
+
+候补目前支持普通钱包账户（EOA），例如 MetaMask 的标准账户。
+
 ## Contracts and settlement
 
 | Network | Contract | Responsibility |
