@@ -1,0 +1,123 @@
+import { BrowserProvider, Contract, Signature, TypedDataEncoder, getAddress, hexlify, isError, randomBytes,
+  type ContractTransactionResponse, type Eip1193Provider, type JsonRpcSigner } from "ethers";
+import { useEffect, useState } from "react";
+import { BASE, USDC, baseAbi, contractAddress, networks, tokenAbi } from "./chain";
+
+interface Wallet extends Eip1193Provider {
+  on?: (name: string, cb: (...args: unknown[]) => void) => void;
+  removeListener?: (name: string, cb: (...args: unknown[]) => void) => void;
+}
+declare global { interface Window { ethereum?: Wallet } }
+
+function injected() {
+  if (!window.ethereum) throw new Error("Open this page in a wallet browser or enable a browser wallet.");
+  return window.ethereum;
+}
+
+export function useWallet() {
+  const [account, setAccount] = useState("");
+  useEffect(() => {
+    const wallet = window.ethereum;
+    if (!wallet) return;
+    let current = true;
+    function update(accounts: unknown) {
+      if (current) setAccount(Array.isArray(accounts) && accounts[0] ? getAddress(accounts[0]) : "");
+    }
+    const refresh = () => { void wallet!.request({ method: "eth_accounts" }).then(update).catch(() => update([])); };
+    refresh();
+    wallet.on?.("accountsChanged", update);
+    wallet.on?.("chainChanged", refresh);
+    return () => { current = false; wallet.removeListener?.("accountsChanged", update); wallet.removeListener?.("chainChanged", refresh); };
+  }, []);
+  async function connect() {
+    const accounts = await injected().request({ method: "eth_requestAccounts" }) as string[];
+    if (!accounts[0]) throw new Error("Select an account to connect.");
+    setAccount(getAddress(accounts[0]));
+  }
+  return { account, connect };
+}
+
+export async function baseSigner(account: string) {
+  const wallet = injected();
+  const chainId = "0x" + BASE.toString(16);
+  if (Number(await wallet.request({ method: "eth_chainId" })) !== BASE) {
+    try {
+      await wallet.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
+    } catch (err) {
+      if ((err as {code?: number}).code !== 4902) throw err;
+      await wallet.request({ method: "wallet_addEthereumChain", params: [{ chainId, chainName: "Base Sepolia",
+        nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+        rpcUrls: [networks.base.url], blockExplorerUrls: [networks.base.explorer] }] });
+      await wallet.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
+    }
+  }
+  const provider = new BrowserProvider(wallet);
+  if ((await provider.getNetwork()).chainId !== BigInt(BASE)) throw new Error("Select Base Sepolia in your wallet.");
+  return provider.getSigner(account);
+}
+
+export const workshopWith = (signer: JsonRpcSigner) => new Contract(contractAddress("base"), baseAbi, signer);
+export type Notify = (text: string, hash?: string) => void;
+
+export async function confirm(tx: ContractTransactionResponse, notify: Notify) {
+  notify("Waiting for Base confirmation…", tx.hash);
+  try {
+    const receipt = await tx.wait(1);
+    if (receipt?.status !== 1) throw new Error("The transaction did not confirm.");
+    return receipt.hash;
+  } catch (error) {
+    if (isError(error, "TRANSACTION_REPLACED") && !error.cancelled && error.receipt.status === 1) return error.receipt.hash;
+    throw error;
+  }
+}
+
+export async function buy(signer: JsonRpcSigner, qty: number, price: bigint, notify: Notify) {
+  const token = new Contract(USDC, tokenAbi, signer);
+  const address = contractAddress("base");
+  const total = BigInt(qty) * price;
+  if (await token.allowance(signer.address, address) < total) {
+    notify("Approve the exact ticket total in your wallet.");
+    await confirm(await token.approve(address, total), notify);
+  }
+  notify("Confirm the ticket purchase in your wallet.");
+  return confirm(await workshopWith(signer).buy(qty), notify);
+}
+
+export async function join(signer: JsonRpcSigner, qty: number, userDeadline: number, notify: Notify) {
+  const token = new Contract(USDC, tokenAbi, signer);
+  const workshop = workshopWith(signer);
+  const [name, version, separator, price, start, block] = await Promise.all([
+    token.name(), token.version(), token.DOMAIN_SEPARATOR(), workshop.ticketPrice(), workshop.eventStartTime(),
+    signer.provider.getBlock("latest"),
+  ]);
+  const validBefore = Math.min(userDeadline, Number(start));
+  if (!block || !Number.isSafeInteger(validBefore) || validBefore <= block.timestamp) throw new Error("Choose a future deadline.");
+  const domain = { name, version, chainId: BASE, verifyingContract: USDC };
+  if (TypedDataEncoder.hashDomain(domain) !== separator) throw new Error("The USDC signing domain could not be verified.");
+  const nonce = hexlify(randomBytes(32));
+  const fields = { ReceiveWithAuthorization: [
+    { name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" },
+  ] };
+  notify("Step 1 of 2 · Sign the exact USDC authorization.");
+  const sig = Signature.from(await signer.signTypedData(domain, fields, { from: signer.address, to: contractAddress("base"),
+    value: BigInt(qty) * price, validAfter: 0, validBefore, nonce }));
+  notify("Step 2 of 2 · Confirm your waitlist entry on Base.");
+  return confirm(await workshop.enqueue(qty, userDeadline, [nonce, sig.v, sig.r, sig.s]), notify);
+}
+
+export function walletError(err: unknown) {
+  const e = err as { code?: string | number; revert?: {name: string}; data?: string; shortMessage?: string; message?: string };
+  if (e.code === 4001 || e.code === "ACTION_REJECTED") return "Request declined in your wallet.";
+  let name = e.revert?.name;
+  if (!name && typeof e.data === "string") {
+    try { name = networks.base.abi.parseError(e.data)?.name; } catch { /* Non-contract wallet error. */ }
+  }
+  const errors: Record<string, string> = {
+    EventStarted: "The workshop has started.", SeatsUnavailable: "Availability changed. Check the latest seat count.",
+    SalesAvailable: "Public seats are available again.", InvalidAuthorization: "The authorization is invalid or expired.",
+    NotQueued: "This order has already been resolved.", NotTicketOwner: "This ticket is no longer in your wallet.",
+    RetryCoolingDown: "Wait 15 seconds before requesting another retry.",
+  };
+  return (name && errors[name]) || e.shortMessage || e.message || "The wallet request failed.";
+}
