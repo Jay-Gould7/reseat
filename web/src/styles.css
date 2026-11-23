@@ -238,6 +238,15 @@ footer { border-top: 1px solid var(--line); background: #f3f4f7; }
 .form-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
 .reserve-note,.hold-note { background: #f1f4ff; color: #384981; border-radius: 8px; padding: .8rem; font-size: .88rem; }
 .reserve-note svg { flex-shrink: 0; }
+.funding-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(285px,100%),1fr)); gap: 1rem; align-items: start; }
+.funding-card { display: grid; gap: 1rem; min-width: 0; }
+.funding-card h2 { font-size: 1.25rem; }
+.funding-card p,.funding-card dt { color: var(--muted); font-size: .9rem; }
+.funding-card details summary { cursor: pointer; }
+.funding-card details .publish-form { margin-top: .7rem; }
+.funding-balances { border-block: 1px solid var(--line); padding-block: .55rem; }
+.funding-balances > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .35rem; padding-block: .25rem; }
+.funding-balances dd { font-weight: 650; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .route-message { margin-block: 3rem; }
 .route-message a { margin-top: 1rem; }
 .hero-copy h1,.event-description,.metadata span { overflow-wrap: anywhere; }

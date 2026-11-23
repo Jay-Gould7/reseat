@@ -1,7 +1,7 @@
 import { BrowserProvider, Contract, Signature, TypedDataEncoder, getAddress, hexlify, isError, randomBytes,
   type ContractTransactionResponse, type Eip1193Provider, type JsonRpcSigner } from "ethers";
 import { useEffect, useState } from "react";
-import { BASE, USDC, baseAbi, bindingStatus, contractAddress, factoryAbi, networks, readBaseBinding, readLasna, tokenAbi } from "./chain";
+import { BASE, USDC, baseAbi, bindingStatus, contractAddress, factoryAbi, networks, readBaseBinding, readLasna, tokenAbi, type Chain } from "./chain";
 
 interface Wallet extends Eip1193Provider {
   on?: (name: string, cb: (...args: unknown[]) => void) => void;
@@ -37,30 +37,30 @@ export function useWallet() {
   return { account, connect };
 }
 
-export async function baseSigner(account: string) {
+export async function walletSigner(account: string, chain: Chain = "base") {
   const wallet = injected();
-  const chainId = "0x" + BASE.toString(16);
-  if (Number(await wallet.request({ method: "eth_chainId" })) !== BASE) {
+  const net = networks[chain], chainId = "0x" + net.id.toString(16);
+  if (Number(await wallet.request({ method: "eth_chainId" })) !== net.id) {
     try {
       await wallet.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
     } catch (err) {
       if ((err as {code?: number}).code !== 4902) throw err;
-      await wallet.request({ method: "wallet_addEthereumChain", params: [{ chainId, chainName: "Base Sepolia",
-        nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
-        rpcUrls: [networks.base.url], blockExplorerUrls: [networks.base.explorer] }] });
+      await wallet.request({ method: "wallet_addEthereumChain", params: [{ chainId, chainName: net.label,
+        nativeCurrency: { name: chain === "base" ? "Ether" : "Lasna REACT", symbol: chain === "base" ? "ETH" : "lREACT", decimals: 18 },
+        rpcUrls: [net.url], blockExplorerUrls: [net.explorer] }] });
       await wallet.request({ method: "wallet_switchEthereumChain", params: [{ chainId }] });
     }
   }
   const provider = new BrowserProvider(wallet);
-  if ((await provider.getNetwork()).chainId !== BigInt(BASE)) throw new Error("Select Base Sepolia in your wallet.");
+  if ((await provider.getNetwork()).chainId !== BigInt(net.id)) throw new Error("Select " + net.label + " in your wallet.");
   return provider.getSigner(account);
 }
 
 export const workshopWith = (source: string, signer: JsonRpcSigner) => new Contract(source, baseAbi, signer);
-export type Notify = (text: string, hash?: string) => void;
+export type Notify = (text: string, hash?: string, chain?: Chain) => void;
 
-export async function confirm(tx: ContractTransactionResponse, notify: Notify) {
-  notify("Waiting for Base confirmation…", tx.hash);
+export async function confirm(tx: ContractTransactionResponse, notify: Notify, chain: Chain = "base") {
+  notify("Waiting for " + networks[chain].label + " confirmation…", tx.hash, chain);
   try {
     const receipt = await tx.wait(1);
     if (receipt?.status !== 1) throw new Error("The transaction did not confirm.");

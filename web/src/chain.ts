@@ -1,4 +1,4 @@
-import { Contract, Interface, JsonRpcProvider, ZeroAddress, formatUnits, getAddress, isAddress, type Provider } from "ethers";
+import { Contract, Interface, JsonRpcProvider, ZeroAddress, formatUnits, getAddress, isAddress, isError, type Provider } from "ethers";
 
 export const USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 export const BASE = 84532;
@@ -7,6 +7,8 @@ const detailsTuple = "(string name,string location,string description,string cov
 export const factoryAbi = [
   "function createEvent(" + detailsTuple + " info,uint256 start,uint32 capacity,uint256 price) payable returns (address)",
   "function watcher() view returns (address)", "function callbackDeposit() view returns (uint256)",
+  "function callbackProxy() view returns (address)", "function FEE_BUDGET_VERSION() view returns (uint256)",
+  "event FeeRefundState(address indexed source,uint256 indexed revision,uint256 start,bool refunded)",
   "function isEvent(address) view returns (bool)", "function eventCount() view returns (uint256)",
   "function events(uint256) view returns (address)", "function retryActivation(address)",
   "function activationRetryAt(address) view returns (uint256)",
@@ -26,7 +28,14 @@ export const baseAbi = [
   "function orderInfo(uint256) view returns (address buyer,uint32 qty,uint256 deadline,uint8 status)",
   "function buy(uint32 qty)", "function refund(uint256 ticketId)",
   "function enqueue(uint32 qty,uint256 userDeadline,(bytes32 nonce,uint8 v,bytes32 r,bytes32 s) auth) returns (uint256)",
-  "function retryPayment(address reactive_,uint256 expectedHeadId,uint8 attempt)",
+  "function retryPayment(address reactive_,uint256 expectedHeadId,uint8 attempt,uint256 deliveryId)",
+  "function settle(address reactive_,uint256 expectedHeadId,uint256 deliveryId)", "function confirmBinding(address reactive_,uint256 deliveryId)",
+  "function topUpFees() payable", "function feesRefunded() view returns (bool)", "function returnedFees() view returns (uint256)",
+  "function feeRecipient() view returns (address)",
+  "function feeCloseConfirmed() view returns (bool)", "function deliveredCallbacks() view returns (uint256)",
+  "function expectedCallbacks() view returns (uint256)", "function nextFeeRetry() view returns (uint256)",
+  "function retryFeeRefund()", "function setFeeRecipient(address)",
+  "event FeeBudgetFunded(address indexed organizer,uint256 amount)", "event FeeBudgetReturned(address indexed recipient,uint256 amount)",
   "function cancel(uint256 id)", "function requestSettlementRetry()", "function withdrawProceeds()",
   "event TicketsIssued(uint256 indexed firstId,address indexed buyer,uint256 indexed orderId,uint32 qty)",
   "event TicketRefunded(uint256 indexed ticketId,address indexed buyer,uint256 amount)",
@@ -42,6 +51,7 @@ export const watcherAbi = [
   "function factory() view returns (address)",
   "function sourceState(address) view returns ((bool registered,uint256 revision,uint256 head,uint256 deadline,uint256 available,uint256 slot,uint256 lastCronAt,uint256 lastAnnouncementAt,uint256 paymentRetryAt,uint256 lastPaymentAt,uint8 paymentAttempts))",
   "event SourceBound(address indexed source)",
+  "event FeeRefundRequested(address indexed source,uint256 issued)",
   "event CronChanged(address indexed source,bool active,uint256 headId,uint256 deadline,bool subscriptionChanged)",
   "event SettlementRequested(address indexed source,uint256 indexed headId,bool fromCron,bytes32 indexed sourceTx,uint8 paymentAttempt)",
 ];
@@ -182,5 +192,21 @@ export async function readPublishSettings() {
   if (!networks.base.address) return null;
   const rpc = await reader("base");
   const factory = new Contract(contractAddress("base"), factoryAbi, rpc);
-  return { fee: BigInt(await factory.callbackDeposit()) };
+  const [fee, refundable] = await Promise.all([factory.callbackDeposit(), refundableFactory(factory)]);
+  return { fee: BigInt(fee), refundable };
+}
+
+export async function refundableFactory(factory: Contract) {
+  try {
+    const version = await factory.FEE_BUDGET_VERSION();
+    if (version !== 1n) throw new Error("Unsupported event funding version.");
+    return true;
+  } catch (error) {
+    if (isError(error, "CALL_EXCEPTION")) {
+      const rpcError = error.info?.error;
+      // The Base Sepolia public RPC omits the data field on an empty legacy-selector revert.
+      if (error.data === "0x" || (error.data == null && rpcError?.code === 3 && rpcError.message === "execution reverted")) return false;
+    }
+    throw error;
+  }
 }

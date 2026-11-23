@@ -10,6 +10,10 @@ struct EventDetails {
 
 interface IEventDirectory {
     event EventCreated(address indexed eventAddress, address indexed organizer, uint256 announcedAt);
+    event FeeRefundState(address indexed source, uint256 indexed revision, uint256 start, bool refunded);
+    function reportFeeRefund() external;
+    function finalizeFeeRefund(address reactive_, address source, uint256 issued) external;
+    function confirmFailedDelivery(address reactive_, address source, uint256 deliveryId) external;
 }
 
 library PaymentRetries {
@@ -33,7 +37,7 @@ interface ISettlement {
         uint256 availableSpots,
         uint256 paymentRetryAt
     );
-    function confirmBinding(address reactive_) external;
-    function settle(address reactive_, uint256 expectedHeadId) external;
-    function retryPayment(address reactive_, uint256 expectedHeadId, uint8 attempt) external;
+    function confirmBinding(address reactive_, uint256 deliveryId) external;
+    function settle(address reactive_, uint256 expectedHeadId, uint256 deliveryId) external;
+    function retryPayment(address reactive_, uint256 expectedHeadId, uint8 attempt, uint256 deliveryId) external;
 }

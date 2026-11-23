@@ -63,7 +63,7 @@ export async function platform(t) {
   const proxy = await deploy(await artifact("MockCallbackProxy", "MockReactiveSystem"), operator);
   const watcher = await deploy(await artifact("WaitlistReactive"), operatorL);
   const factory = await deploy(await artifact("EventFactory"), operator, proxy.target, watcher.target, parseEther("0.001"));
-  await mined(watcher.bindFactory(factory.target));
+  await mined(watcher.bindFactory(factory.target, proxy.target));
   const eventArt = await artifact("EventWaitlist");
   const event = address => new Contract(address, eventArt.abi, operator);
 
@@ -91,9 +91,16 @@ export async function walletPage(browser, platform, wallet, origin) {
   const context = await browser.newContext({ locale: "en-US", timezoneId: "UTC" });
   await context.route("https://covers.reseat.test/**", route => route.fulfill({ path: webRoot + "/public/workshop.jpg" }));
   let connected = false;
+  let chain = platform.base;
   const signatures = [];
   await context.exposeFunction("requestLocalWallet", async ({ method, params = [] }) => {
     if (method === "eth_requestAccounts") connected = true;
+    if (method === "wallet_switchEthereumChain") {
+      const id = Number(params[0].chainId);
+      assert.ok(id === 84532 || id === 5318007);
+      chain = id === 84532 ? platform.base : platform.lasna;
+      return null;
+    }
     if (method === "eth_accounts" || method === "eth_requestAccounts") return connected ? [wallet.address] : [];
     if (method === "eth_signTypedData_v4") {
       const { domain, types, message } = JSON.parse(params[1]);
@@ -105,9 +112,9 @@ export async function walletPage(browser, platform, wallet, origin) {
     if (method === "eth_sendTransaction") {
       const [tx] = params;
       assert.equal(tx.from.toLowerCase(), wallet.address.toLowerCase());
-      return (await wallet.sendTransaction({ to: tx.to, data: tx.data, value: tx.value || 0, gasLimit: tx.gas })).hash;
+      return (await wallet.connect(chain.rpc).sendTransaction({ to: tx.to, data: tx.data, value: tx.value || 0, gasLimit: tx.gas })).hash;
     }
-    return platform.base.rpc.send(method, params);
+    return chain.rpc.send(method, params);
   });
   await context.addInitScript(() => { window.ethereum = { request: window.requestLocalWallet }; });
   const page = await context.newPage();

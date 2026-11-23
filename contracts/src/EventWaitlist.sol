@@ -3,7 +3,7 @@ pragma solidity ^0.8.29;
 
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
-import {ISettlement, EventDetails, PaymentRetries} from "./interfaces/ISettlement.sol";
+import {ISettlement, IEventDirectory, EventDetails, PaymentRetries} from "./interfaces/ISettlement.sol";
 import {IUSDC} from "./interfaces/IUSDC.sol";
 import {TicketBook} from "./TicketBook.sol";
 
@@ -71,6 +71,14 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     mapping(bytes32 => bool) private retried;
     mapping(uint256 => Order) private orders;
     mapping(address => mapping(bytes32 => bool)) public nonceRegistered;
+    mapping(uint256 => bool) private delivered;
+    uint256 public deliveredCallbacks;
+    uint256 public expectedCallbacks;
+    bool public feeCloseConfirmed;
+    bool public feesRefunded;
+    uint256 public returnedFees;
+    address payable public feeRecipient;
+    uint256 public nextFeeRetry;
 
     event BindingConfirmed(address indexed watcher);
     event TicketRefunded(uint256 indexed ticketId, address indexed buyer, uint256 amount);
@@ -78,6 +86,8 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     event OrderResolved(uint256 indexed id, Status status);
     event PaymentDeferred(uint256 indexed id);
     event ProceedsWithdrawn(address indexed organizer, uint256 amount);
+    event FeeBudgetFunded(address indexed organizer, uint256 amount);
+    event FeeBudgetReturned(address indexed recipient, uint256 amount);
 
     error EventStarted();
     error InvalidQuantity();
@@ -99,7 +109,7 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         uint256 start_,
         uint32 capacity_,
         uint256 price_
-    ) AbstractCallback(IPayable(payable(callbackProxy_)), callbackSender_) {
+    ) payable AbstractCallback(IPayable(payable(callbackProxy_)), callbackSender_) {
         require(
             callbackProxy_ != address(0) && callbackSender_ != address(0) && organizer_ != address(0), "Missing address"
         );
@@ -110,6 +120,7 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         );
         factory = msg.sender;
         organizer = organizer_;
+        feeRecipient = payable(organizer_);
         metadata = details_;
         eventStartTime = start_;
         capacity = capacity_;
@@ -121,7 +132,31 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         return metadata;
     }
 
-    function confirmBinding(address reactive_) external onlyServiceProvider onlyCallbackSender(reactive_) {
+    // The watcher numbers each normal request per event. An out-of-order or repeated delivery counts once.
+    modifier recordDelivery(uint256 id) {
+        require(id != 0, "Missing delivery ID");
+        _recordDelivery(id);
+        if (!feeCloseConfirmed) _;
+    }
+
+    function _recordDelivery(uint256 id) private {
+        if (delivered[id]) return;
+        delivered[id] = true;
+        ++deliveredCallbacks;
+        if (feeCloseConfirmed && deliveredCallbacks == expectedCallbacks && !feesRefunded) _reportFees();
+    }
+
+    function confirmFailedDelivery(uint256 id) external {
+        require(msg.sender == factory, "Factory only");
+        _recordDelivery(id);
+    }
+
+    function confirmBinding(address reactive_, uint256 deliveryId)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(reactive_)
+        recordDelivery(deliveryId)
+    {
         if (!automationReady) {
             automationReady = true;
             emit BindingConfirmed(reactive_);
@@ -234,18 +269,20 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         );
     }
 
-    function settle(address reactive_, uint256 expectedHeadId)
+    function settle(address reactive_, uint256 expectedHeadId, uint256 deliveryId)
         external
         onlyServiceProvider
         onlyCallbackSender(reactive_)
+        recordDelivery(deliveryId)
     {
         _settle(expectedHeadId);
     }
 
-    function retryPayment(address reactive_, uint256 expectedHeadId, uint8 attempt)
+    function retryPayment(address reactive_, uint256 expectedHeadId, uint8 attempt, uint256 deliveryId)
         external
         onlyServiceProvider
         onlyCallbackSender(reactive_)
+        recordDelivery(deliveryId)
     {
         Order storage order = orders[expectedHeadId];
         if (
@@ -367,6 +404,62 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
 
     function coverDebt() external {
         _coverDebt();
+    }
+
+    function topUpFees() public payable {
+        require(msg.sender == organizer && !feesRefunded && msg.value != 0, "Funding unavailable");
+        uint256 debt = _SERVICE_PROVIDER.debt(address(this));
+        if (debt != 0 && address(this).balance >= debt) _coverDebt();
+        emit FeeBudgetFunded(msg.sender, msg.value);
+        if (block.timestamp >= eventStartTime && block.timestamp >= nextFeeRetry) _reportFees();
+    }
+
+    receive() external payable override {
+        topUpFees();
+    }
+
+    /// @notice Allows a contract organizer to choose a wallet that can receive native ETH.
+    function setFeeRecipient(address payable recipient) external {
+        require(msg.sender == organizer && recipient != address(0) && !feesRefunded, "Recipient unavailable");
+        feeRecipient = recipient;
+    }
+
+    /// @notice Fallback for a lost network message or a recipient that previously rejected ETH.
+    function retryFeeRefund() external {
+        require(
+            msg.sender == organizer && !feesRefunded && block.timestamp >= eventStartTime
+                && block.timestamp >= nextFeeRetry,
+            "Refund retry unavailable"
+        );
+        _reportFees();
+    }
+
+    function _reportFees() private {
+        nextFeeRetry = block.timestamp + 5 minutes;
+        IEventDirectory(factory).reportFeeRefund();
+    }
+
+    function finalizeFeeRefund(uint256 issued) external {
+        require(msg.sender == factory, "Factory only");
+        if (feesRefunded || block.timestamp < eventStartTime) return;
+        feeCloseConfirmed = true;
+        expectedCallbacks = issued;
+        if (deliveredCallbacks != issued) return;
+        uint256 debt = _SERVICE_PROVIDER.debt(address(this));
+        if (debt > address(this).balance) return;
+        if (debt != 0) _coverDebt();
+        uint256 unused = address(this).balance;
+        feesRefunded = true;
+        if (unused != 0) {
+            (bool ok,) = feeRecipient.call{value: unused, gas: 60000}("");
+            if (!ok) {
+                feesRefunded = false;
+                return;
+            }
+        }
+        returnedFees = unused;
+        emit FeeBudgetReturned(feeRecipient, unused);
+        IEventDirectory(factory).reportFeeRefund();
     }
 
     function withdrawProceeds() external {

@@ -47,7 +47,7 @@ contract ReSeatTest is Test {
         proxy = new MockCallbackProxy();
         factory = new EventFactory(address(proxy), address(watcher), RESERVE);
         vm.chainId(LASNA);
-        watcher.bindFactory(address(factory));
+        watcher.bindFactory(address(factory), address(proxy));
         vm.chainId(BASE);
         workshop = _publish(address(this), "Reactive Builders Workshop", block.timestamp + 7 days, 2, PRICE);
         _activate(workshop);
@@ -210,7 +210,7 @@ contract ReSeatTest is Test {
         _relayState();
         assertEq(_settlements(), 1);
         (ISystemContract.CallbackConfiguration_V_1_0 memory request, address sender) = system.requestAt(requestOffset);
-        assertEq(request.payload, abi.encodeCall(ISettlement.settle, (address(0), id)));
+        assertEq(request.payload, abi.encodeCall(ISettlement.settle, (address(0), id, 2)));
         assertEq(request.recipient, address(workshop));
         assertEq(sender, address(watcher));
         _deliver(0);
@@ -293,7 +293,7 @@ contract ReSeatTest is Test {
         assertTrue(watcher.cronActive());
         assertEq(watcher.sourceState(address(workshop)).head, 2);
         assertEq(watcher.sourceState(address(workshop)).deadline, later);
-        assertEq(system.adds(), 3); // Factory, event state, and shared CRON.
+        assertEq(system.adds(), 5); // Two factory filters, event state, target-specific failures, and seat CRON.
         assertEq(system.removals(), 0);
         vm.warp(later);
         _tick();
@@ -436,20 +436,20 @@ contract ReSeatTest is Test {
 
     function testAuthenticationBindingAndDebtEntrypoints() public {
         vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
-        workshop.settle(address(watcher), 1);
+        workshop.settle(address(watcher), 1, 2);
         vm.prank(address(proxy));
         vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
-        workshop.settle(mei, 1);
+        workshop.settle(mei, 1, 2);
         vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
-        workshop.retryPayment(address(watcher), 1, 1);
+        workshop.retryPayment(address(watcher), 1, 1, 2);
         vm.prank(address(proxy));
         vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
-        workshop.retryPayment(mei, 1, 1);
+        workshop.retryPayment(mei, 1, 1, 2);
         IReactive.LogRecord memory empty;
         vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
         watcher.react(empty);
         vm.expectRevert("Invalid binding");
-        watcher.bindFactory(mei);
+        watcher.bindFactory(mei, address(proxy));
         workshop.coverDebt();
         watcher.coverDebt();
     }
@@ -517,8 +517,8 @@ contract ReSeatTest is Test {
         assertEq(b.details().name, "Evening studio");
         assertEq(b.ticketPrice(), bPrice);
         assertEq(b.eventStartTime(), start + 1 days);
-        assertEq(proxy.reserves(address(a)), RESERVE);
-        assertEq(proxy.reserves(address(b)), RESERVE);
+        assertEq(address(a).balance, RESERVE);
+        assertEq(address(b).balance, RESERVE);
 
         _join(linKey, 2, start, 2 * PRICE);
         _refund(sellerA, 1);
@@ -700,9 +700,9 @@ contract ReSeatTest is Test {
         assertFalse(pending.automationReady());
         vm.prank(address(proxy));
         vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
-        pending.confirmBinding(lin);
+        pending.confirmBinding(lin, 1);
         vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
-        pending.confirmBinding(address(watcher));
+        pending.confirmBinding(address(watcher), 1);
         vm.recordLogs();
         system.deliver(requestOffset, proxy);
         _relayState();
@@ -868,7 +868,7 @@ contract ReSeatTest is Test {
             _tick();
             assertEq(_settlements(), index + 1);
             (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(requestOffset + index);
-            assertEq(request.payload, abi.encodeCall(ISettlement.retryPayment, (address(0), 1, i + 1)));
+            assertEq(request.payload, abi.encodeCall(ISettlement.retryPayment, (address(0), 1, i + 1, index + 2)));
             vm.expectEmit(true, false, false, true, address(workshop));
             emit EventWaitlist.PaymentDeferred(1);
             _deliver(index);
@@ -914,7 +914,7 @@ contract ReSeatTest is Test {
         vm.warp(deadline);
         _tick();
         (ISystemContract.CallbackConfiguration_V_1_0 memory request,) = system.requestAt(requestOffset + 2);
-        assertEq(request.payload, abi.encodeCall(ISettlement.settle, (address(0), 1)));
+        assertEq(request.payload, abi.encodeCall(ISettlement.settle, (address(0), 1, 4)));
         _deliver(2);
         _relayState();
         assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Expired));
