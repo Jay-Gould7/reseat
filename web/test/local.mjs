@@ -62,8 +62,8 @@ export async function platform(t) {
   const system = new Contract(systemAddress, systemArt.abi, operatorL);
   const proxy = await deploy(await artifact("MockCallbackProxy", "MockReactiveSystem"), operator);
   const watcher = await deploy(await artifact("WaitlistReactive"), operatorL);
-  const factory = await deploy(await artifact("EventFactory"), operator, proxy.target, watcher.target, parseEther("0.001"));
-  await mined(watcher.bindFactory(factory.target, proxy.target));
+  const factory = await deploy(await artifact("EventFactory"), operator, proxy.target, watcher.target, parseEther("0.0001"));
+  await mined(watcher.bindFactory(factory.target));
   const eventArt = await artifact("EventWaitlist");
   const event = address => new Contract(address, eventArt.abi, operator);
 

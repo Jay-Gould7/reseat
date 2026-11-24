@@ -27,8 +27,8 @@ test("publish and share two independent events, activate, reserve and recover pa
   async function publish(host, name, days, seats, price) {
     const page = host.page;
     await page.getByRole("link", { name: "Publish event", exact: true }).first().click();
-    await page.getByText("0.001 test ETH", { exact: true }).waitFor();
-    await page.getByText(/unused ETH returns automatically to the organizer/).waitFor();
+    await page.getByText("0.0001 test ETH", { exact: true }).waitFor();
+    await page.getByText(/Unused credit is non-refundable/).waitFor();
     await page.locator('[name="name"]').fill(name);
     await page.locator('[name="start"]').fill(new Date((now + days * 86400) * 1000).toISOString().slice(0, 16));
     await page.locator('[name="capacity"]').fill(String(seats)); await page.locator('[name="price"]').fill(price);
@@ -196,7 +196,6 @@ test("open queue uses Base time, complete history and all pages without a refund
   }
   await p.base.rpc.send("anvil_mine", ["0x3"]);
   const page = await browser.newPage({ locale: "zh-CN" });
-  page.setDefaultTimeout(7000);
   let releaseHistory;
   const historyGate = new Promise(resolve => { releaseHistory = resolve; });
   t.after(() => releaseHistory());
@@ -215,7 +214,8 @@ test("open queue uses Base time, complete history and all pages without a refund
   assert.equal(await rows.count(), 5);
   await p.base.rpc.send("evm_setNextBlockTimestamp", [deadline]);
   await p.base.rpc.send("evm_mine", []);
-  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+  assert.equal(Number((await p.base.rpc.send("eth_getBlockByNumber", ["latest", false])).timestamp), deadline);
+  // Let the open page observe the deadline on its next eight-second poll.
   await queue.getByText("1 open", { exact: true }).waitFor();
   assert.equal(await rows.count(), 1);
   assert.match(await rows.first().innerText(), /Order #2/);
@@ -236,82 +236,43 @@ test("open queue uses Base time, complete history and all pages without a refund
   assert.equal(await event.ticketBalance(buyerC.address), 1n);
 });
 
-test("fund both networks in the browser and return the unused event budget with every page closed", { timeout: 150_000 }, async t => {
+test("top up the Lasna watcher and an event's Base proxy credit from the funding page", { timeout: 120_000 }, async t => {
   const { p, browser, origin, server } = await openPlatform(t);
-  const host = await actor(p.base.rpc);
-  await p.lasna.rpc.send("anvil_setBalance", [host.address, toBeHex(parseEther("1"))]);
+  const host = await actor(p.base.rpc), sponsor = await actor(p.base.rpc);
+  await p.lasna.rpc.send("anvil_setBalance", [sponsor.address, toBeHex(parseEther("1"))]);
   const start = (await p.base.rpc.getBlock("latest")).timestamp + 86400;
-  const initial = parseEther("0.001"), extra = parseEther("0.0002"), fee = parseEther("0.00005");
-  await mined(p.factory.connect(host).createEvent(["Budget Lab", "", "", ""], start, 3, 1_000_000n, { value: initial }));
-  const event = p.event(await p.factory.events(0));
-  const { page } = await walletPage(browser, p, host, origin + "/?event=" + event.target);
+  const initial = await p.factory.callbackDeposit();
+  await mined(p.factory.connect(host).createEvent(["Funding Lab", "", "", ""], start, 3, 1_000_000n, { value: initial }));
+  const event = await p.factory.events(0);
+
+  const guest = await browser.newPage({ locale: "en-US" });
+  await guest.goto(origin + "/?funding");
+  await guest.getByLabel("Base event address").fill(event);
+  await guest.getByRole("button", { name: "View event balance" }).click();
+  await guest.getByText("0.0001 ETH", { exact: true }).waitFor();
+  await guest.getByRole("region", { name: "Event callbacks" }).getByRole("button", { name: "Connect wallet to fund" }).waitFor();
+  assert.equal(await guest.getByRole("region", { name: "Automatic refund delivery" }).count(), 0);
+
+  const { page } = await walletPage(browser, p, sponsor, origin + "/?event=" + event);
   await page.getByRole("link", { name: "Event funding", exact: true }).click();
-  const eventCard = page.getByRole("region", { name: "Event callbacks", exact: true });
-  const watcherCard = page.getByRole("region", { name: "Platform watcher", exact: true });
-  const refundCard = page.getByRole("region", { name: "Automatic refund delivery", exact: true });
-  await eventCard.getByText("0.001 ETH", { exact: true }).waitFor();
-  await eventCard.getByLabel("Top-up amount (ETH)").fill("0");
-  assert.ok(await eventCard.getByRole("button", { name: "Add ETH" }).isDisabled());
-  await eventCard.getByLabel("Top-up amount (ETH)").fill("0.0002");
-  await eventCard.getByRole("button", { name: "Add 0.0002 ETH" }).click();
-  await eventCard.getByText("0.0012 ETH", { exact: true }).waitFor();
-  assert.equal(await p.base.rpc.getBalance(event.target), initial + extra);
-  await watcherCard.getByLabel("Top-up amount (lREACT)").fill("0.1");
-  await watcherCard.getByRole("button", { name: "Add 0.1 lREACT" }).click();
-  await watcherCard.getByText("0.1 lREACT", { exact: true }).waitFor();
-  const lasnaLink = page.getByRole("link", { name: "View on Reactscan" });
-  assert.match(await lasnaLink.getAttribute("href"), /^https:\/\/lasna\.reactscan\.net\/tx\/0x/);
+  const watcher = page.getByRole("region", { name: "Platform watcher" });
+  await watcher.getByLabel("Top-up amount (lREACT)").fill("0.1");
+  await watcher.getByRole("button", { name: "Add 0.1 lREACT" }).click();
+  await watcher.getByText("0.1 lREACT", { exact: true }).waitFor();
+  assert.match(await page.getByRole("link", { name: "View on Reactscan" }).getAttribute("href"), /^https:\/\/lasna\.reactscan\.net\/tx\/0x/);
+
+  const callbacks = page.getByRole("region", { name: "Event callbacks" });
+  await callbacks.getByLabel("Top-up amount (ETH)").fill("0");
+  assert.ok(await callbacks.getByRole("button", { name: "Add ETH" }).isDisabled());
+  await callbacks.getByLabel("Top-up amount (ETH)").fill("0.0002");
+  await callbacks.getByRole("button", { name: "Add 0.0002 ETH" }).click();
+  await callbacks.getByText("0.0003 ETH", { exact: true }).waitFor();
+  assert.match(await page.getByRole("link", { name: "View on BaseScan" }).getAttribute("href"), /^https:\/\/sepolia\.basescan\.org\/tx\/0x/);
+  assert.equal(await p.proxy.reserves(event), initial + parseEther("0.0002"));
+  assert.equal(await p.base.rpc.getBalance(event), 0n);
+  assert.equal(await p.proxy.reserves(p.factory.target), 0n);
   assert.equal(await p.system.reserves(p.watcher.target), parseEther("0.1"));
-  await refundCard.getByLabel("Top-up amount (ETH)").fill("0.001");
-  await refundCard.getByRole("button", { name: "Add 0.001 ETH" }).click();
-  await refundCard.getByText("0.001 ETH", { exact: true }).waitFor();
-  assert.equal(await p.proxy.reserves(p.factory.target), initial);
-  assert.equal(await p.proxy.reserves(event.target), 0n);
+
   const budgets = await server.ssrLoadModule("/src/feeBudget.ts");
-  await assert.rejects(budgets.readFunding("event", host.address), /Choose an event/);
-  await page.close();
-
-  const before = await p.base.rpc.getBalance(host.address);
-  await mined(p.proxy.setDeliveryFee(fee));
-  await p.relay((await p.factory.queryFilter(p.factory.filters.EventCreated()))[0]);
-  await p.relay((await p.factory.queryFilter(p.factory.filters.FeeRefundState()))[0]);
-  await p.deliver(0, event.target);
-  await p.base.rpc.send("evm_setNextBlockTimestamp", [start]);
-  await p.base.rpc.send("evm_mine", []);
-  await p.lasna.rpc.send("evm_setNextBlockTimestamp", [start]);
-  await mined(p.system.relay(p.watcher.target, {
-    chainId: 5318007, contractAddress: await p.watcher.CRON_EMITTER(), topic0: await p.watcher.refundCronTopic(),
-    topic1: 0, topic2: 0, topic3: 0, data: "0x", blockNumber: 0, opCode: 1, blockHash: 0, txHash: 0, logIndex: 0
-  }));
-  await p.deliver(1, p.factory.target);
-  await p.relay((await p.factory.queryFilter(p.factory.filters.FeeRefundState())).at(-1));
-  assert.equal(await event.feesRefunded(), true);
-  assert.equal(await p.base.rpc.getBalance(host.address), before + initial + extra - fee);
-  assert.equal(await p.proxy.reserves(p.factory.target), initial - fee);
-  assert.equal(await p.watcher.refundCronActive(), false);
-  const publicPage = await browser.newPage({ locale: "en-US" });
-  await publicPage.goto(origin + "/?funding&event=" + event.target);
-  await publicPage.getByText(/Unused ETH returned/).waitFor();
-  await publicPage.getByText("0.00115 ETH", { exact: true }).waitFor();
-  await p.base.rpc.send("anvil_mine", ["0x3"]);
-  await p.lasna.rpc.send("anvil_mine", ["0x2"]);
-  await publicPage.getByRole("link", { name: "View refund in event activity" }).click();
-  await publicPage.getByText("Lasna requested the automatic ETH refund", { exact: true }).waitFor();
-  await publicPage.getByText("0.00115 ETH returned to " + host.address, { exact: true }).waitFor();
-
-  // An existing factory has no funding-version getter. Quote its own immutable amount and proxy-only policy.
-  const legacy = await browser.newPage({ locale: "en-US" });
-  await legacy.route(p.base.url + "/**", async route => {
-    const call = route.request().postDataJSON();
-    if (call?.method !== "eth_call") return route.continue();
-    const sig = call.params[0].data;
-    if (sig === p.factory.interface.encodeFunctionData("FEE_BUDGET_VERSION"))
-      return route.fulfill({ json: { jsonrpc: "2.0", id: call.id, error: { code: 3, message: "execution reverted" } } });
-    if (sig === p.factory.interface.encodeFunctionData("callbackDeposit"))
-      return route.fulfill({ json: { jsonrpc: "2.0", id: call.id, result: p.factory.interface.encodeFunctionResult("callbackDeposit", [parseEther("0.0001")]) } });
-    return route.continue();
-  });
-  await legacy.goto(origin + "/?publish");
-  await legacy.getByText("0.0001 test ETH", { exact: true }).waitFor();
-  await legacy.getByText(/Unused credit is non-refundable/).waitFor();
+  await assert.rejects(budgets.readFunding("event", host.address), /Choose an event published by this factory/);
 });

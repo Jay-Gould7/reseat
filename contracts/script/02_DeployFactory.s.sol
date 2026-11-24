@@ -11,7 +11,7 @@ contract DeployFactory is Script {
         address proxy = vm.envAddress("BASE_CALLBACK_PROXY");
         address token = vm.envAddress("BASE_USDC_ADDRESS");
         require(token == 0x036CbD53842c5426634e7929541eC2318f3dCF7e && token.code.length != 0, "Check USDC");
-        uint256 reserve = vm.envOr("BASE_EVENT_CALLBACK_WEI", uint256(0.001 ether));
+        uint256 reserve = vm.envUint("BASE_EVENT_CALLBACK_WEI");
         vm.startBroadcast(vm.envUint("DEPLOYER_PRIVATE_KEY"));
         EventFactory factory = new EventFactory(proxy, watcher, reserve);
         vm.stopBroadcast();

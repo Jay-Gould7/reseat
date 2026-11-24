@@ -10,7 +10,7 @@ contract BindSource is Script {
         WaitlistReactive watcher = WaitlistReactive(payable(vm.envAddress("VITE_REACTIVE_ADDRESS")));
         address source = vm.envAddress("VITE_FACTORY_ADDRESS");
         vm.startBroadcast(vm.envUint("DEPLOYER_PRIVATE_KEY"));
-        watcher.bindFactory(source, vm.envAddress("BASE_CALLBACK_PROXY"));
+        watcher.bindFactory(source);
         vm.stopBroadcast();
         console2.log("Subscribed to Base Sepolia factory", source);
     }

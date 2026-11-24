@@ -1,4 +1,4 @@
-import { formatEther, zeroPadValue, type JsonRpcProvider, type LogDescription } from "ethers";
+import { zeroPadValue, type JsonRpcProvider, type LogDescription } from "ethers";
 import { contractAddress, formatTime, networks, reader, type Chain } from "./chain";
 
 export interface Entry {
@@ -133,9 +133,6 @@ export function describe(entry: Entry) {
     case "SettlementRequested": return a.paymentAttempt > 0n ? `CRON requested payment retry ${a.paymentAttempt} for order #${a.headId}` :
       `${a.fromCron ? "CRON" : "Lasna"} requested settlement for order #${a.headId}`;
     case "ProceedsWithdrawn": return "Organizer withdrew ticket proceeds";
-    case "FeeBudgetFunded": return formatEther(a.amount) + " ETH added to the event budget";
-    case "FeeBudgetReturned": return formatEther(a.amount) + " ETH returned to " + a.recipient;
-    case "FeeRefundRequested": return "Lasna requested the automatic ETH refund";
     default: return entry.event.name;
   }
 }

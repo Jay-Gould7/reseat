@@ -242,8 +242,6 @@ footer { border-top: 1px solid var(--line); background: #f3f4f7; }
 .funding-card { display: grid; gap: 1rem; min-width: 0; }
 .funding-card h2 { font-size: 1.25rem; }
 .funding-card p,.funding-card dt { color: var(--muted); font-size: .9rem; }
-.funding-card details summary { cursor: pointer; }
-.funding-card details .publish-form { margin-top: .7rem; }
 .funding-balances { border-block: 1px solid var(--line); padding-block: .55rem; }
 .funding-balances > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .35rem; padding-block: .25rem; }
 .funding-balances dd { font-weight: 650; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }

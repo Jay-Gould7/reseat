@@ -20,9 +20,9 @@ Joining the waitlist currently requires an externally owned account (EOA), such 
 
 | Network | Contract | Responsibility |
 | --- | --- | --- |
-| Base Sepolia · 84532 | `EventFactory` | Creates each event with its organizer and ETH budget. Pays for delivery of the final automatic refund |
+| Base Sepolia · 84532 | `EventFactory` | Records each event, passes the publishing wallet as organizer, deposits its Base callback reserve and announces its address |
 | Base Sepolia | One `EventWaitlist` per event | Holds that event’s USDC, immutable terms, metadata, numbered non-transferable admissions and FIFO queue |
-| Reactive Lasna · 5318007 | Shared `WaitlistReactive` | Discovers events, schedules their waitlist callbacks independently and returns unused budgets after opening |
+| Reactive Lasna · 5318007 | Shared `WaitlistReactive` | Discovers events from the trusted factory, keeps independent revisions, heads and deadlines and sends each callback to its originating event |
 
 1. The watcher subscribes to the factory’s `EventCreated`. On discovery it subscribes to the child’s `SettlementState` and requests `confirmBinding` on that child. The Base callback authenticates both the proxy and watcher, then publishes a fresh inventory snapshot. This includes sales and refunds made before the subscription. The UI verifies factory membership, the configured watcher in both Base contracts, the watcher’s bound factory, registration for this exact event and receipt of a positive state revision on Lasna.
 2. A direct sale issues individually refundable ticket IDs. A refund burns the ID and returns its ticket price in one transaction. While the queue is active, public sales cannot take its seats. Only the publishing wallet can withdraw retained USDC after the event starts.
@@ -48,11 +48,13 @@ npm test
 npm run dev
 ```
 
-For an existing Chromium installation, set `RESEAT_BROWSER` to its executable path and omit the browser download. The browser test starts two loopback Anvil chains and Vite with temporary wallets and local mocks. It exercises two organizers, sharing into a fresh mobile browser, binding, purchases, signed orders, refunds and recovery after a failed collection. The preceding Foundry run produces its required artifacts. The regular dev server uses the platform settings in the root `.env`.
+For an existing Chromium installation, set `RESEAT_BROWSER` to its executable path and omit the browser download. The browser tests start two loopback Anvil chains and Vite with temporary wallets and local mocks. They exercise two organizers, sharing into a fresh mobile browser, binding, purchases, signed orders, refunds, recovery after a failed collection and top-ups on both networks. The preceding Foundry run produces their required artifacts. The regular dev server uses the platform settings in the root `.env`.
 
 ## Deploy the platform once
 
-Review `.env.example`. Set `LASNA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`, the Base callback proxy and Circle test USDC. New factories default to a refundable event budget of **0.001 test ETH** (1000000000000000 wei). `BASE_EVENT_CALLBACK_WEI` sets the exact amount at factory deployment. Keep `DEPLOYER_PRIVATE_KEY` in the local ignored environment. Only the `VITE_` settings go into the frontend bundle.
+The active testnet platform uses the contracts from `23e89b3`. To use it, copy the four public address and start-block settings from `.env.example` to your environment and build the frontend. The factory charges **0.0001 test ETH** per event for Base callbacks.
+
+For a fresh platform, set `LASNA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`, the Base callback proxy and Circle test USDC. `BASE_EVENT_CALLBACK_WEI` sets the per-event reserve when deploying a new factory. Keep `DEPLOYER_PRIVATE_KEY` in the local ignored environment. Only the `VITE_` settings go into the frontend bundle.
 
 Run the following as the operator. Save real receipt addresses and deployment block numbers to the root `.env` and reload it at the indicated steps.
 
@@ -78,19 +80,9 @@ forge script script/04_FundingCommands.s.sol:FundingCommands
 
 Use the same revision for the watcher, factory and frontend. The automatic payment retry uses an updated settlement event and callback interface. Build the web app with the two platform addresses and their start blocks. The Base start block is the **factory deployment block**. Browser-safe public RPC overrides are `VITE_BASE_RPC_URL` and `VITE_LASNA_RPC_URL`. Later publications are discovered by address using the same web build. The static site supports share links without server-side routing.
 
-### Automation funding and automatic refunds
+**Funding.** Open **Automation funding** in the footer to see the Lasna watcher's execution credit and outstanding debt, or open **Event funding** from an event page to see its Base callback balance. The platform operator can top up the watcher with Lasna test REACT (lREACT). The host pays Base gas and the factory’s ETH reserve when publishing. The factory credits that event on the Base callback proxy. Anyone can top up its reserve with Base test ETH.
 
-Open **Automation funding** in the footer, or **Event funding** from an event. Balances and outstanding debt are public. The wallet switches to the selected network for each deposit.
-
-| Budget | Who funds it | How it is used |
-| --- | --- | --- |
-| Event callbacks · Base test ETH | Organizer, at publication or using `topUpFees()` | The event holds the ETH and pays the callback proxy for actual usage. The organizer receives unused ETH automatically. |
-| Automatic refund delivery · Base test ETH | Platform operator, using `depositTo(factory)` on the Base callback proxy | Shared credit pays for the final callback. Fund this before opening the platform to hosts. |
-| Platform watcher · Lasna lREACT | Platform operator, using `depositTo(watcher)` on the Lasna system | Shared credit pays for Reactive execution across events. |
-
-The watcher keeps one shared refund timer. It uses Cron10000 for distant openings and switches to Cron100 within four hours of the earliest check. The timer switches off when no refund checks remain. Cron10 remains dedicated to held seats. On the first due tick the watcher stops issuing waitlist callbacks for the event and sends its final issued count to the factory. Base checks its own timestamp, counts distinct deliveries and settles the event’s proxy debt before returning the remaining ETH. A charged callback that reverted is reconciled from the trusted Base proxy’s event-specific `CallbackFailure` receipt. The platform pays for reconciliation and the final refund callback. No guest or organizer needs to keep a page open or submit a claim. The event timeline links the refund receipt. [Reactive fees and reserves](https://dev.reactive.network/economy) · [CRON events](https://dev.reactive.network/reactive-contracts)
-
-The watcher processes up to four due refunds per tick and retries a close up to three times at intervals of at least five minutes. A late final delivery or a funded recovery can schedule a fresh check. A request with no destination receipt keeps the budget in the event pending network delivery. For interrupted service, restore the applicable fee balance and use **Retry refund check**. A watcher owner can replay an already verified failure report using `retryFailureReport(event,id)`. An organizer whose wallet rejects ETH can specify a receiving wallet under **Refund recovery**. USDC ticket proceeds remain separately withdrawable by the organizer.
+The funding page switches the wallet to the selected chain and calls `depositTo` on its fee service. Unused prepaid credit stays on that service after the event starts. The watcher and each event also expose `coverDebt()` for native funds sent directly to the contracts. Ticket refunds and organizer proceeds are paid separately in USDC. [Reactive funding and debt](https://dev.reactive.network/economy)
 
 **Recovery.** A host can replay the factory announcement on Base after five minutes if activation stalls. After Base confirmation one additional replay can repair a lost initial snapshot. After the third automatic payment request, the watcher keeps the deadline timer. A retry due at or after the deadline is omitted. A refund that only partially covers the head waits for more seats or expiry. When inventory and queued orders coexist, a guest can request settlement manually, including after automatic retries run out. Each distinct head, inventory, observed payment state and processed payment attempt allows one public replay. Empty or repeatedly unchanged requests revert before emitting a new report. After restoring funding, the watcher owner can call `syncEvent(eventAddress)` on Lasna for a registered event when repeated deliveries have failed. Only authenticated callbacks can settle orders.
 
@@ -98,15 +90,13 @@ The watcher processes up to four due refunds per tick and retries a close up to 
 
 | Contract | Address |
 | --- | --- |
-| Lasna watcher | [`0xff65ff2b10814487f19F01D55920748B30bAC9f6`](https://lasna.reactscan.net/address/0xff65ff2b10814487f19F01D55920748B30bAC9f6) · [Deployment at block 9071223](https://lasna.reactscan.net/tx/0x4d555af387007eb0541733b647bdeb1c2e6b9718cde6c29e5054f6343a6079ac) |
-| Base Sepolia factory | [`0xff65ff2b10814487f19F01D55920748B30bAC9f6`](https://sepolia.basescan.org/address/0xff65ff2b10814487f19F01D55920748B30bAC9f6) · [Deployment at block 62658997](https://base-sepolia.blockscout.com/tx/0x81f46eb0d4956035bf1b0faaeb14eea7f9f581d2428c3bf1caaaef7717290aac) |
+| Lasna watcher | [`0x86080d9B0a8A0F8244bAA756001A531986683a40`](https://lasna.reactscan.net/address/0x86080d9B0a8A0F8244bAA756001A531986683a40) · [Deployment at block 9061849](https://lasna.reactscan.net/tx/0x4a61e80c77d2a5e8c66eb78765eafbe26e805f0630605ae2f3bcde7e75203f6a) |
+| Base Sepolia factory | [`0x30f8D0140C181cEb12Fd7f8325DD3c9e58520E3e`](https://sepolia.basescan.org/address/0x30f8D0140C181cEb12Fd7f8325DD3c9e58520E3e) · [Deployment at block 62609418](https://sepolia.basescan.org/tx/0x86b40961f27d725ae813d3ac2e0ccac48febdbf310e4abcfb3f56d253e7873dd) |
 | Published demo event | Pending publication |
 | Base Sepolia callback proxy | `0x476F44b11F5C942c58f4c8E3d0300E5710743585` |
 | Base Sepolia Circle test USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
 
-The active factory reports fee budget version 1 and requires **0.001 test ETH** at publication. At Lasna block 9071367, the watcher subscribed to the Base factory’s `EventCreated` and `FeeRefundState` logs. The deployer used nonce 2 on both chains, so the watcher and the factory share the same hexadecimal address. The root `.env.example` includes both networks’ addresses and deployment blocks. [Factory binding receipt](https://lasna.reactscan.net/tx/0x217551febecc0cf7a21d6eb3034a026bdb11370d814d9c80df237a68926af4ad)
-
-The previous deployment used a non-refundable 0.0001 test ETH reserve. Its public receipts are available for the [Lasna watcher deployment](https://lasna.reactscan.net/tx/0x4a61e80c77d2a5e8c66eb78765eafbe26e805f0630605ae2f3bcde7e75203f6a), [Base factory deployment](https://sepolia.basescan.org/tx/0x86b40961f27d725ae813d3ac2e0ccac48febdbf310e4abcfb3f56d253e7873dd) and [factory binding](https://lasna.reactscan.net/tx/0x18bcdb3ea92de520c9ddb5de8731d44d7712c66985f368e5107afb502e87dadb).
+The Lasna watcher bound this Base factory and subscribed to its `EventCreated` event at block 9062029. [Binding receipt](https://lasna.reactscan.net/tx/0x18bcdb3ea92de520c9ddb5de8731d44d7712c66985f368e5107afb502e87dadb)
 
 [Reactive network addresses](https://dev.reactive.network/origins-and-destinations) · [Circle USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses#testnet)
 
