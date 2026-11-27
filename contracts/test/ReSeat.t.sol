@@ -9,7 +9,13 @@ import {IReactive} from "@reactive/src/interfaces/IReactive.sol";
 import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
 import {EventFactory} from "../src/EventFactory.sol";
 import {TicketBook} from "../src/TicketBook.sol";
-import {IEventDirectory, EventDetails, ISettlement} from "../src/interfaces/ISettlement.sol";
+import {
+    IEventDirectory,
+    EventDetails,
+    ISettlement,
+    SponsoredJoin,
+    SponsoredCancel
+} from "../src/interfaces/ISettlement.sol";
 import {EventWaitlist} from "../src/EventWaitlist.sol";
 import {WaitlistReactive} from "../src/WaitlistReactive.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
@@ -185,6 +191,152 @@ contract ReSeatTest is Test {
 
     function _status(uint256 id) private view returns (EventWaitlist.Status status) {
         (,,, status) = workshop.orderInfo(id);
+    }
+
+    function _sponsored(uint256 key, uint32 qty) private returns (SponsoredJoin memory order) {
+        order.buyer = vm.addr(key);
+        order.qty = qty;
+        order.deadline = start;
+        order.salt = bytes32(++nonceSeed);
+        bytes32 nonce = workshop.sponsoredNonce(order.buyer, qty, start, order.salt);
+        EventWaitlist.Signature memory sig = _sign(key, qty, start, nonce);
+        (order.v, order.r, order.s) = (sig.v, sig.r, sig.s);
+    }
+
+    function _cancelIntent(uint256 key, uint256 id, address target)
+        private
+        view
+        returns (SponsoredCancel memory intent)
+    {
+        intent.orderId = id;
+        intent.validBefore = block.timestamp + 15 minutes;
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("ReSeat"),
+                keccak256("1"),
+                BASE,
+                target
+            )
+        );
+        bytes32 body = keccak256(
+            abi.encode(keccak256("CancelWaitlist(uint256 orderId,uint256 validBefore)"), id, intent.validBefore)
+        );
+        (intent.v, intent.r, intent.s) = vm.sign(key, keccak256(abi.encodePacked(hex"1901", domain, body)));
+    }
+
+    function testSponsoredQueueAndExitForTwoWalletsUseEventReserve() public {
+        SponsoredJoin memory a = _sponsored(linKey, 2);
+        SponsoredJoin memory b = _sponsored(meiKey, 1);
+        token.mint(lin, 2 * PRICE);
+        token.mint(mei, PRICE);
+        vm.etch(mei, abi.encodePacked(hex"ef0100", sellerB));
+        uint256 fee = RESERVE / 10;
+        proxy.setDeliveryFee(fee);
+        vm.chainId(LASNA);
+        watcher.setWaitlistRelay(address(this));
+        watcher.requestEnrollment(address(workshop), a);
+        watcher.requestEnrollment(address(workshop), b);
+        vm.chainId(BASE);
+        assertEq(workshop.nextId(), 1);
+        _deliver(0);
+        _deliver(1);
+        assertEq(workshop.orderIdForNonce(lin, workshop.sponsoredNonce(lin, 2, start, a.salt)), 1);
+        assertEq(workshop.orderIdForNonce(mei, workshop.sponsoredNonce(mei, 1, start, b.salt)), 2);
+        assertEq(proxy.reserves(address(workshop)), RESERVE - 2 * fee);
+        assertEq(lin.balance + mei.balance, 0);
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+        assertEq(token.balanceOf(mei), PRICE);
+        SponsoredCancel memory intent = _cancelIntent(linKey, 1, address(workshop));
+        vm.chainId(LASNA);
+        watcher.requestCancellation(address(workshop), intent);
+        vm.chainId(BASE);
+        _deliver(2);
+        assertEq(proxy.reserves(address(workshop)), RESERVE - 3 * fee);
+        _deliver(0);
+        _deliver(2);
+        assertEq(workshop.activeOrders(), 1);
+        assertEq(workshop.nextId(), 3);
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Cancelled));
+        _refund(sellerA, 1);
+        _relayState();
+        _deliver(3);
+        assertEq(workshop.ticketOwner(3), mei);
+        assertEq(token.balanceOf(mei), 0);
+        assertEq(token.balanceOf(lin), 2 * PRICE);
+    }
+
+    function testSponsorChecksRelayTargetSessionAndBothCallbackIdentities() public {
+        SponsoredJoin memory a = _sponsored(linKey, 2);
+        vm.chainId(LASNA);
+        vm.expectRevert("Only waitlist relay");
+        watcher.requestEnrollment(address(workshop), a);
+        vm.prank(lin);
+        vm.expectRevert("Only owner");
+        watcher.setWaitlistRelay(lin);
+        watcher.setWaitlistRelay(address(this));
+        vm.expectRevert("Request unavailable");
+        watcher.requestEnrollment(sellerA, a);
+        watcher.requestEnrollment(address(workshop), a);
+        vm.expectRevert("Delivery pending");
+        watcher.requestEnrollment(address(workshop), a);
+        vm.chainId(BASE);
+        vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
+        workshop.enqueueSponsored(address(watcher), a);
+        vm.startPrank(address(proxy));
+        vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
+        workshop.enqueueSponsored(lin, a);
+        a.qty = 1;
+        vm.expectRevert(EventWaitlist.InvalidAuthorization.selector);
+        workshop.enqueueSponsored(address(watcher), a);
+        vm.stopPrank();
+        vm.warp(start);
+        vm.expectRevert(EventWaitlist.EventStarted.selector);
+        _deliver(0);
+        assertEq(workshop.activeOrders(), 0);
+    }
+
+    function testSponsoredCancellationChecksOrderBuyerEventAndExpiry() public {
+        _join(linKey, 1, start, PRICE);
+        SponsoredCancel memory wrongBuyer = _cancelIntent(meiKey, 1, address(workshop));
+        SponsoredCancel memory wrongEvent = _cancelIntent(linKey, 1, address(factory));
+        SponsoredCancel memory valid = _cancelIntent(linKey, 1, address(workshop));
+        vm.expectPartialRevert(AbstractPayer.NotAuthorized.selector);
+        workshop.cancelSponsored(address(watcher), valid);
+        vm.startPrank(address(proxy));
+        vm.expectPartialRevert(AbstractCallback.CallbackNotAuthorized.selector);
+        workshop.cancelSponsored(mei, valid);
+        vm.expectRevert(EventWaitlist.InvalidAuthorization.selector);
+        workshop.cancelSponsored(address(watcher), wrongBuyer);
+        vm.expectRevert(EventWaitlist.InvalidAuthorization.selector);
+        workshop.cancelSponsored(address(watcher), wrongEvent);
+        vm.warp(valid.validBefore);
+        vm.expectRevert(EventWaitlist.InvalidAuthorization.selector);
+        workshop.cancelSponsored(address(watcher), valid);
+        vm.stopPrank();
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.Queued));
+    }
+
+    function testLostSponsoredDeliveryCanRecoverAfterFundingWithoutDuplicatingOrder() public {
+        SponsoredJoin memory order = _sponsored(linKey, 1);
+        vm.chainId(LASNA);
+        watcher.setWaitlistRelay(address(this));
+        watcher.requestEnrollment(address(workshop), order);
+        vm.chainId(BASE);
+        proxy.setDeliveryFee(RESERVE + 1);
+        vm.expectRevert("Event credit depleted");
+        _deliver(0);
+        assertEq(workshop.activeOrders(), 0);
+        vm.deal(address(this), RESERVE + 2);
+        proxy.depositTo{value: RESERVE + 2}(address(workshop));
+        vm.warp(block.timestamp + 5 minutes);
+        vm.chainId(LASNA);
+        watcher.requestEnrollment(address(workshop), order);
+        vm.chainId(BASE);
+        _deliver(1);
+        _deliver(0);
+        assertEq(workshop.nextId(), 2);
+        assertEq(workshop.activeOrders(), 1);
     }
 
     function testWholeOrderHoldsThenChargesAndIssuesTwoBoundTickets() public {

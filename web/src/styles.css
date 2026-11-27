@@ -37,11 +37,19 @@ nav, .nav-actions, .wallet-button, .wallet-connected, .network-tag, .context, .p
 nav { gap: 1.65rem; }
 nav a { color: #535763; font-size: .9rem; font-weight: 550; }
 nav a:hover, .footer-inner a:hover { color: var(--blue); }
+nav a[aria-current] { color: var(--blue); font-weight: 700; }
 .nav-actions { margin-left: auto; gap: 1.05rem; }
 .network-tag { gap: .45rem; font-size: .8rem; color: #555b67; font-weight: 600; }
 .network-tag i, .testnet-mark { display: inline-block; width: 8px; height: 8px; background: #2850ed; border-radius: 2px; }
 .wallet-button, .wallet-connected { gap: .5rem; background: #23242a; color: #fff; border: 1px solid #23242a; padding: .62rem .9rem; border-radius: 10px; font-size: .85rem; font-weight: 650; min-height: 39px; }
-.wallet-button:hover { background: #3a3d47; }
+.wallet-button:hover,.wallet-connected:hover { background: #3a3d47; }
+.wallet-picker { width: min(420px, calc(100% - 2rem)); max-height: 85dvh; margin: auto; padding: 1.4rem; border: 1px solid var(--line); border-radius: 16px; background: white; color: inherit; }
+.wallet-picker::backdrop { background: #1e233460; }
+.wallet-picker h3 { margin: 1.1rem 0 .45rem; font-size: .88rem; color: var(--muted); }
+.wallet-option { display: flex; justify-content: space-between; align-items: center; gap: .6rem; width: 100%; padding: .65rem .5rem; text-align: left; overflow-wrap: anywhere; border-radius: 7px; }
+.wallet-option svg { flex-shrink: 0; }
+.wallet-option:hover,.wallet-option[aria-pressed="true"] { background: #eef2ff; }
+.wallet-picker .text-action { margin-top: .5rem; }
 button:disabled { opacity: .55; }
 .context { gap: .52rem; margin: 2rem 0 1.05rem; color: #606473; font-size: .84rem; font-weight: 520; }
 .context svg { color: #454959; }
@@ -136,6 +144,17 @@ a.explorer:hover, .source-link:hover, .text-action:hover { text-decoration: unde
 .form-note svg { flex-shrink: 0; margin-top: .1rem; }
 .personal > p, .personal-row:first-of-type { margin-top: .85rem; }
 .personal h2 { font-size: 1.3rem; }
+.my-order { display: grid; gap: .4rem; margin-top: .85rem; padding-top: .8rem; border-top: 1px solid var(--line); }
+.my-orders .tabs { margin-block: .8rem .3rem; }
+.my-order h3 { font-size: 1rem; font-weight: 650; }
+.my-order .hold-note { margin: .25rem 0; }
+.cancel-order { justify-self: start; padding: .5rem .75rem; min-height: 40px; border: 1px solid #cfd4df; border-radius: 8px; font-size: .85rem; font-weight: 600; }
+.cancel-order:enabled:hover { background: #f3f4f7; }
+.organizer-tools summary { font-weight: 650; cursor: pointer; }
+.organizer-tools p { margin: .85rem 0; font-size: .87rem; color: var(--muted); }
+.my-order small,.inventory-line { color: var(--muted); }
+.my-order .text-action { justify-self: start; }
+.inventory-line { margin-top: .65rem; font-size: .9rem; }
 .inline-note, .connection-note { margin-top: .6rem; color: #555c6c; font-size: .85rem; }
 .connection-note { display: flex; gap: .5rem; align-items: center; padding: .6rem .8rem; background: #fff5e9; border-radius: 8px; }
 .connection-note svg { flex-shrink: 0; }
@@ -247,6 +266,9 @@ footer { border-top: 1px solid var(--line); background: #f3f4f7; }
 .funding-balances dd { font-weight: 650; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
 .route-message { margin-block: 3rem; }
 .route-message a { margin-top: 1rem; }
+.route-title { margin-block: 1rem; font-size: 2rem; }
+.route-loading { margin-block: 1rem; color: var(--muted); }
+.directory-title .text-action { margin-top: .6rem; }
 .hero-copy h1,.event-description,.metadata span { overflow-wrap: anywhere; }
 .event-description { white-space: pre-line; }
 .binding-status { margin-top: .85rem; font-size: .85rem; color: #91521d; font-weight: 600; }
@@ -258,6 +280,13 @@ footer { border-top: 1px solid var(--line); background: #f3f4f7; }
   .publish-intro img { display: none; }
   .publish-form { width: 100%; }
   .nav-actions { gap: .6rem; }
-  .nav-shell { gap: .55rem; }
+  .nav-shell { display: grid; grid-template-columns: auto 1fr; gap: .2rem .55rem; padding-top: .55rem; }
+  .nav-shell nav { display: flex; grid-column: 1 / -1; grid-row: 2; gap: 1.2rem; }
+  .nav-shell nav a { padding-block: .55rem; }
+  .nav-actions { grid-column: 2; grid-row: 1; justify-self: end; }
   .site-header .wallet-button,.site-header .wallet-connected { padding: .5rem .65rem; }
+}
+@media (max-width: 380px) {
+  .wordmark .brand-name { display: none; }
+  .nav-actions .wallet-connected svg:first-child { display: none; }
 }

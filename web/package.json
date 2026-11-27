@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "scripts": { "dev": "vite", "build": "tsc --noEmit && vite build", "preview": "vite preview", "test": "node --test test/journey.mjs" },
+  "scripts": { "dev": "vite", "build": "tsc --noEmit && vite build", "preview": "vite preview", "relay": "node --env-file-if-exists=../.env relay/server.mjs", "test": "node --test test/journey.mjs" },
   "dependencies": {
     "@fontsource-variable/bricolage-grotesque": "^5.2.0",
     "@fontsource-variable/dm-sans": "^5.2.0",

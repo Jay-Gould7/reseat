@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { networks, readBase, readLasna, type Chain, type TicketCursor } from "./chain";
-import { createLedger } from "./ledger";
+import { cachedPreview, networks, readBase, readLasna, type Chain, type TicketCursor } from "./chain";
+import { createLedger, type Entry } from "./ledger";
+import { createQueueReader, type QueueSnapshot } from "./orders";
+const emptyEntries: Entry[] = [];
 
 export const signalConfirmation = () => window.dispatchEvent(new Event("reseat:confirmed"));
 
@@ -9,21 +11,23 @@ function message(error: unknown) {
   return "The public RPC is unavailable. Retrying automatically.";
 }
 
-export function usePolling<T>(load: (stale: () => boolean) => Promise<T>) {
-  const [data, setData] = useState<T>();
-  const [error, setError] = useState("");
+export function usePolling<T>(load: (stale: () => boolean, partial: (data: T) => void) => Promise<T>) {
+  const [snapshot, setSnapshot] = useState<{ load: typeof load; data?: T; error: string }>();
   useEffect(() => {
-    let stopped = false, running = false, pending = false;
+    let stopped = false, running = false, pending = false, hasResult = false;
     let timer: ReturnType<typeof setTimeout>;
     async function tick() {
       clearTimeout(timer);
       if (running) { pending = true; return; }
       running = true;
       try {
-        const value = await load(() => stopped);
-        if (!stopped) { setData(value); setError(""); }
+        const value = await load(() => stopped, data => {
+          if (!stopped && !hasResult) setSnapshot({ load, data, error: "" });
+        });
+        hasResult = true;
+        if (!stopped) setSnapshot({ load, data: value, error: "" });
       } catch (reason) {
-        if (!stopped) setError(message(reason));
+        if (!stopped) setSnapshot(prev => ({ load, data: prev?.load === load ? prev.data : undefined, error: message(reason) }));
       } finally {
         running = false;
         if (!stopped) {
@@ -36,7 +40,7 @@ export function usePolling<T>(load: (stale: () => boolean) => Promise<T>) {
     window.addEventListener("reseat:confirmed", tick);
     return () => { stopped = true; clearTimeout(timer); window.removeEventListener("reseat:confirmed", tick); };
   }, [load]);
-  return { data, error };
+  return snapshot?.load === load ? snapshot : { data: undefined, error: "" };
 }
 
 function useHistory(chain: Chain, source: string) {
@@ -48,15 +52,21 @@ function useHistory(chain: Chain, source: string) {
     return rows;
   }, [index]);
   const { data, error } = usePolling(read);
-  return { entries: data ?? [], error, syncing: Boolean(networks[chain].address && !error && (syncing || !data)) };
+  return { entries: data?.entries ?? emptyEntries, through: data?.through ?? -1, error, syncing: Boolean(networks[chain].address && !error && (syncing || !data)) };
 }
 
 export function useWorkshop(source: string, account: string, cursor: TicketCursor) {
-  const loadBase = useCallback(() => readBase(source, account, cursor), [source, account, cursor]);
+  const [preview, setPreview] = useState(() => cachedPreview(source));
+  const loadBase = useCallback((stale: () => boolean) => readBase(source, account, cursor, value => {
+    if (!stale()) setPreview(value);
+  }), [source, account, cursor]);
   const base = usePolling(loadBase);
+  const verified = base.data?.event.binding.source ?? (preview ? source : undefined);
+  const loadQueue = useMemo(() => verified ? createQueueReader(verified) : async () => undefined, [verified]);
+  const queue = usePolling<QueueSnapshot | undefined>(loadQueue);
   const loadLasna = useCallback(() => readLasna(source), [source]);
   const lasna = usePolling(loadLasna);
   const baseHistory = useHistory("base", source);
   const lasnaHistory = useHistory("lasna", source);
-  return { base, lasna, baseHistory, lasnaHistory };
+  return { base, preview, lasna, queue, baseHistory, lasnaHistory };
 }

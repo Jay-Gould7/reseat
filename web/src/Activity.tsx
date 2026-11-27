@@ -1,87 +1,50 @@
 import { useMemo, useState } from "react";
-import { Activity as Pulse, Armchair, Clock3, ExternalLink, Layers3, ListOrdered, Radio, Timer } from "lucide-react";
-import { formatTime, localText, networks, shortAddress, txUrl, type Chain, type Workshop, type Watcher } from "./chain";
-import { describe, ordersFrom, statusNames, type Entry } from "./ledger";
+import { ZeroHash } from "ethers";
+import { Activity as Pulse, Armchair, ExternalLink, ListOrdered, Radio, Users } from "lucide-react";
+import { formatTime, localText as t, networks, txUrl, type Chain, type Workshop, type Watcher } from "./chain";
+import { describe, type Entry } from "./ledger";
 
 interface Props {
-  event?: Workshop | null;
-  watcher?: Watcher | null;
-  bound: boolean;
-  base: Entry[];
-  lasna: Entry[];
-  now: number;
-  account: string;
-  busy: boolean;
-  errors: string[];
-  syncing: boolean;
-  orderHistory: "loading" | "ready" | "unavailable";
-  cancel: (id: string) => void;
-  retry: () => void;
+  event: Workshop; watcher?: Watcher | null; bound: boolean;
+  openCount?: number; queueError: boolean;
+  base: Entry[]; lasna: Entry[]; errors: string[]; syncing: boolean;
 }
 
-export function Activity({ event, watcher, bound, base, lasna, now, account, busy, errors, syncing, orderHistory, cancel, retry }: Props) {
-  const [allOrders, setAllOrders] = useState(false);
+export function Activity({ event, watcher, bound, openCount, queueError, base, lasna, errors, syncing }: Props) {
   const [filter, setFilter] = useState<"all" | Chain>("all");
-  const [orderLimit, setOrderLimit] = useState(5);
-  const [logLimit, setLogLimit] = useState(6);
-  const orders = useMemo(() => ordersFrom(base), [base]);
-  const open = useMemo(() => orders.filter(order => order.status === 1 && now < order.deadline), [orders, now]);
-  const ranks = useMemo(() => new Map(open.map((order, i) => [order.id, i + 1])), [open]);
-  const visible = allOrders ? orders : open;
-  const historyMessage = orderHistory === "loading" ? "Reading orders…" :
-    orderHistory === "unavailable" ? "Order history unavailable" : "";
-  const logs = useMemo(() => [...base, ...lasna].sort((a, b) => b.time - a.time ||
-    (a.chain === b.chain ? b.block - a.block || b.index - a.index : a.chain.localeCompare(b.chain)))
-    .filter(row => filter === "all" || row.chain === filter), [base, lasna, filter]);
-  const matches = bound && watcher;
+  const [limit, setLimit] = useState(6);
+  const logs = useMemo(() => [...base, ...lasna]
+    .filter(row => filter === "all" || row.chain === filter)
+    .flatMap(row => { const label = describe(row); return label ? [{ row, label }] : []; })
+    .sort((a, b) => b.row.time - a.row.time || (a.row.chain === b.row.chain
+      ? b.row.block - a.row.block || b.row.index - a.row.index : a.row.chain.localeCompare(b.row.chain))), [base, lasna, filter]);
   return <>
     <section className="panel queue" id="waitlist" aria-labelledby="queue-title">
-      <div className="section-heading"><div className="heading-icon"><ListOrdered size={20} /><h2 id="queue-title">Waitlist</h2></div>
-        <span className="count-label" role="status">{historyMessage || open.length + " open"}</span></div>
+      <div className="heading-icon"><ListOrdered size={20} /><h2 id="queue-title">{t("Waitlist overview", "候补概况")}</h2></div>
       <div className="metric-grid">
-        <div><Armchair size={17} /><span>{localText("Public seats", "可售票数")}</span><strong>{event?.publicSeats ?? "—"} <small>/ {event?.capacity ?? "—"}</small></strong></div>
-        <div><Clock3 size={17} /><span>{localText("Held seats", "已暂留")}</span><strong>{event?.held ?? "—"}</strong></div>
-        <div><Radio size={17} /><span>Lasna CRON</span><strong className={"cron-value " + (matches && watcher.active ? "active" : "")}>{matches ? watcher.active ? "Active" : "Off" : "Pending"}</strong></div>
+        <div><Armchair size={17} /><span>{t("Public seats", "可售票数")}</span><strong>{event.publicSeats} <small>/ {event.capacity}</small></strong></div>
+        <div><Users size={17} /><span>{t("Open orders", "有效候补订单")}</span><strong role="status">{openCount ?? <small>{queueError ? t("Unavailable", "暂不可用") : t("Loading…", "读取中…")}</small>}</strong></div>
+        <div><Radio size={17} /><span>{t("Deadline checks", "自动检查期限")}</span><strong className={"cron-value " + (bound && watcher?.active ? "active" : "")}>
+          {!bound ? t("Pending", "待启用") : watcher?.active ? t("Active", "运行中") : t("Standby", "待命")}</strong></div>
       </div>
-      {event && event.held > 0 && <p className="hold-note">{event.blocked ?
-        localText("Payment delayed. The head order keeps its place and reserved seats.", "收款暂时中断。队首顺位和暂留票已保留。") :
-        localText(`Holding ${event.held} ${event.held === 1 ? "seat" : "seats"} · ${event.headQty - event.held} more needed. No USDC charged.`,
-          `已暂留 ${event.held} 张，还差 ${event.headQty - event.held} 张，尚未扣款`)}</p>}
-      {matches && watcher.active && watcher.paymentRetryAt > 0 && <p className="inline-note">
-        {localText("Next automatic payment retry", "下次自动重试收款")} · {formatTime(watcher.paymentRetryAt)}</p>}
-      {matches && watcher.active && <p className="inline-note">Tracking the head deadline · {formatTime(watcher.deadline)}</p>}
-      <div className="tabs" aria-label="Queue view">{["Open orders", "All orders"].map((s, i) =>
-        <button key={s} aria-pressed={allOrders === Boolean(i)} onClick={() => { setAllOrders(Boolean(i)); setOrderLimit(5); }}>{s}</button>)}</div>
-      {historyMessage ? null : !visible.length ? <div className="empty"><Layers3 size={21} /><div><strong>
-        {allOrders ? "No confirmed orders" : "No open orders"}</strong>
-        <p>Requests appear here in the order they join.</p></div></div> :
-        <ol className="order-list">{visible.slice(0, orderLimit).map(o => <li key={o.id}>
-          <span className="rank" aria-label="Queue position">{ranks.has(o.id) ? "#" + ranks.get(o.id) : "–"}</span>
-          <div className="order-label"><strong>Order #{o.id} · {o.qty} {o.qty === 1 ? "ticket" : "tickets"}</strong>
-            <small>{shortAddress(o.buyer)} · Until {formatTime(o.deadline)}</small></div>
-          <div className="order-state"><span className={"pill " + (o.status === 2 ? "pill-green" : "")}>{o.status === 1 && !ranks.has(o.id) ?
-            localText("Deadline passed", "已过截止时间") : o.status === 3 ? localText("Skipped · Expired", "已确认过期") : o.status >= 3 ? "Skipped · " + statusNames[o.status] : statusNames[o.status]}</span>
-            {o.status === 1 && o.buyer.toLowerCase() === account.toLowerCase() &&
-              <button className="text-action" disabled={busy} onClick={() => cancel(o.id)}>Cancel order</button>}</div>
-        </li>)}</ol>}
-      {!historyMessage && visible.length > orderLimit && <button className="text-action" onClick={() => setOrderLimit(v => v + 10)}>Show more orders</button>}
-      {event?.canRetry && <button className="retry" disabled={busy} onClick={retry}><Timer size={15} />Request settlement retry</button>}
+      <p className="inline-note">{t("Returned seats go to the next group in line. Payment is collected when the whole group can be seated.",
+        "退回的票按候补顺序分配。凑齐一笔订单的全部票后，才会扣款出票。")}</p>
     </section>
     <section className="panel activity" id="activity" aria-labelledby="activity-title">
-      <div className="section-heading"><div className="heading-icon"><Pulse size={20} /><h2 id="activity-title">Onchain activity</h2></div></div>
-      <div className="tabs" aria-label="Activity network">{(["all", "base", "lasna"] as const).map(f =>
-        <button key={f} aria-pressed={filter === f} onClick={() => { setFilter(f); setLogLimit(6); }}>{f === "all" ? "All chains" : networks[f].label}</button>)}</div>
+      <div className="heading-icon"><Pulse size={20} /><h2 id="activity-title">{t("Event activity", "活动动态")}</h2></div>
+      <div className="tabs" aria-label={t("Activity network", "动态所属网络")}>{(["all", "base", "lasna"] as const).map(f =>
+        <button type="button" key={f} aria-pressed={filter === f} onClick={() => { setFilter(f); setLimit(6); }}>
+          {f === "all" ? t("All networks", "全部网络") : networks[f].label}</button>)}</div>
       {errors.map(err => <p className="inline-note problem" key={err}>{err}</p>)}
-      {logs.length === 0 ? <div className="empty"><Pulse size={21} /><div><strong>{syncing ? "Syncing chain history…" : "No confirmed activity"}</strong>
-        <p>Ticket transactions and Lasna responses will appear here.</p></div></div> :
-        <ol className="timeline">{logs.slice(0, logLimit).map(row => <li key={row.chain + row.hash + row.index}>
-          <span className={"timeline-dot " + row.chain} />
-          <div><strong>{describe(row)}</strong><small>{formatTime(row.time)} · {networks[row.chain].label}</small>
-            {row.event.name === "SettlementRequested" && <a className="source-link" target="_blank" rel="noreferrer"
-              href={txUrl(row.event.args.fromCron ? "lasna" : "base", row.event.args.sourceTx)}>Trigger transaction <ExternalLink size={11} /></a>}</div>
+      {!logs.length ? <p className="inline-note" role="status">{syncing ? t("Loading activity…", "正在读取活动动态…") :
+        t("No confirmed activity to show.", "暂无可展示的活动动态。")}</p> :
+        <ol className="timeline">{logs.slice(0, limit).map(({ row, label }) => <li key={row.chain + row.hash + row.index}>
+          <span className={"timeline-dot " + row.chain} /><div><strong>{label}</strong><small>{formatTime(row.time)} · {networks[row.chain].label}</small>
+            {row.event.name === "SettlementRequested" && row.event.args.sourceTx !== ZeroHash && <a className="source-link" target="_blank" rel="noreferrer"
+              href={txUrl(row.event.args.fromCron ? "lasna" : "base", row.event.args.sourceTx)}>{t("Trigger transaction", "触发此检查的交易")} <ExternalLink size={11} /></a>}</div>
           <a className="explorer" href={txUrl(row.chain, row.hash)} target="_blank" rel="noreferrer">{row.chain === "base" ? "BaseScan" : "Reactscan"} <ExternalLink size={13} /></a>
         </li>)}</ol>}
-      {logs.length > logLimit && <button className="text-action" onClick={() => setLogLimit(v => v + 10)}>Show more activity</button>}
+      {logs.length > limit && <button type="button" className="text-action" onClick={() => setLimit(v => v + 10)}>{t("Show more activity", "查看更多动态")}</button>}
     </section>
   </>;
 }

@@ -8,6 +8,24 @@ struct EventDetails {
     string cover;
 }
 
+struct SponsoredJoin {
+    address buyer;
+    uint32 qty;
+    uint256 deadline;
+    bytes32 salt;
+    uint8 v;
+    bytes32 r;
+    bytes32 s;
+}
+
+struct SponsoredCancel {
+    uint256 orderId;
+    uint256 validBefore;
+    uint8 v;
+    bytes32 r;
+    bytes32 s;
+}
+
 interface IEventDirectory {
     event EventCreated(address indexed eventAddress, address indexed organizer, uint256 announcedAt);
 }
@@ -34,6 +52,8 @@ interface ISettlement {
         uint256 paymentRetryAt
     );
     function confirmBinding(address reactive_) external;
+    function enqueueSponsored(address reactive_, SponsoredJoin calldata order) external returns (uint256);
+    function cancelSponsored(address reactive_, SponsoredCancel calldata intent) external;
     function settle(address reactive_, uint256 expectedHeadId) external;
     function retryPayment(address reactive_, uint256 expectedHeadId, uint8 attempt) external;
 }

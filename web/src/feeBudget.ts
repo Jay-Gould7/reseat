@@ -1,6 +1,6 @@
 import { Contract, MaxUint256, getAddress, parseEther, type Provider } from "ethers";
 import { contractAddress, factoryAbi, networks, reader, type Chain } from "./chain";
-import { confirm, walletSigner, type Notify } from "./wallet";
+import { confirm, type GetSigner, type Notify } from "./wallet";
 
 export type Fund = "event" | "watcher";
 const system = "0x8888888888888888888888888888888888888888";
@@ -40,8 +40,8 @@ export function nativeAmount(text: string) {
   try { const value = parseEther(text.trim()); return value <= MaxUint256 ? value : 0n; } catch { return 0n; }
 }
 
-export async function fundBudget(fund: Fund, source: string | null, shown: Budget, value: bigint, account: string, notify: Notify) {
-  const chain = fundChain(fund), signer = await walletSigner(account, chain);
+export async function fundBudget(fund: Fund, source: string | null, shown: Budget, value: bigint, getSigner: GetSigner, notify: Notify) {
+  const chain = fundChain(fund), signer = await getSigner(chain);
   const target = await fundingTarget(fund, source, signer.provider);
   if (target.address !== shown.address || target.service !== shown.service || value <= 0n)
     throw new Error("Funding settings changed. Refresh and review the amount.");

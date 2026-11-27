@@ -46,8 +46,8 @@ export function Publish({ account, busy, connect, submit }: {
     <label><span><ImagePlus size={15} /> {localText("Cover image", "活动封面")} <small>{localText("Optional", "选填")}</small></span><input name="cover" type="url" placeholder="https://…" /></label>
     <div className="reserve-note"><CalendarClock size={18} /><p>{settings.data ?
       <><strong>{formatEther(settings.data.fee)} {localText("test ETH", "测试 ETH")}</strong>{" "}
-        {localText("is prepaid to the callback proxy for this event. Unused credit is non-refundable. Wallet gas is additional.",
-          "预存到本场活动的回调代理，未使用余额不可退。钱包交易费另计。")}</> :
+        {localText("pays for this event’s Base callbacks, including entry and cancellation on sponsorship-enabled events. Unused credit is non-refundable. Your wallet pays the publication fee.",
+          "用于本场活动的 Base 回调；支持代付的活动也从中支付加入和取消候补的手续费。未使用余额不可退，发布交易手续费由你的钱包支付。")}</> :
       settings.error || "The callback reserve appears when the Base factory is connected."}</p></div>
     {error && <p role="alert" className="problem">{error}</p>}
     <button className="primary" disabled={busy || !settings.data || Boolean(settings.error)}>{account ? localText("Publish event", "发布活动") : localText("Connect wallet to publish", "连接钱包发布")}</button>

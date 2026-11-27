@@ -70,6 +70,11 @@ contract MockReactiveSystem is ISystemContract {
 
 contract MockCallbackProxy {
     mapping(address => uint256) public reserves;
+    uint256 public deliveryFee;
+
+    function setDeliveryFee(uint256 fee) external {
+        deliveryFee = fee;
+    }
 
     function depositTo(address target) external payable {
         reserves[target] += msg.value;
@@ -77,6 +82,8 @@ contract MockCallbackProxy {
 
     function forward(address target, bytes memory payload, address sender, uint64 gasLimit) external {
         require(sender != address(0) && payload.length >= 36, "Invalid request");
+        require(reserves[target] >= deliveryFee, "Event credit depleted");
+        reserves[target] -= deliveryFee;
         // Skip the bytes length and the four-byte selector to overwrite the reserved ABI word.
         assembly ("memory-safe") { mstore(add(payload, 36), sender) }
         (bool ok, bytes memory result) = target.call{gas: gasLimit}(payload);

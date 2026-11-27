@@ -1,4 +1,5 @@
-import { Contract, Interface, JsonRpcProvider, ZeroAddress, formatUnits, getAddress, isAddress, type Provider } from "ethers";
+import { Contract, Interface, JsonRpcProvider, ZeroAddress, ZeroHash, formatUnits, getAddress, isAddress, isError, type Provider } from "ethers";
+import sponsorshipAbi from "../relay/abi.json";
 
 export const USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 export const BASE = 84532;
@@ -14,6 +15,7 @@ export const factoryAbi = [
   "event EventCreated(address indexed eventAddress,address indexed organizer,uint256 announcedAt)",
 ];
 export const baseAbi = [
+  ...sponsorshipAbi.event,
   "function details() view returns (" + detailsTuple + ")",
   "function capacity() view returns (uint32)", "function ticketPrice() view returns (uint256)",
   "function eventStartTime() view returns (uint256)", "function availableSpots() view returns (uint256)",
@@ -24,6 +26,7 @@ export const baseAbi = [
   "function ticketsPage(address,uint256,uint32) view returns (uint256[] ids,uint256 nextGrant,uint32 nextOffset,bool more)",
   "function settlementState() view returns (uint256 head,uint256 deadline,uint256 heldSpots,bool ready,bool paymentBlocked)",
   "function canRetrySettlement() view returns (bool)",
+  "function headId() view returns (uint256)", "function nextId() view returns (uint256)", "function activeOrders() view returns (uint256)",
   "function orderInfo(uint256) view returns (address buyer,uint32 qty,uint256 deadline,uint8 status)",
   "function buy(uint32 qty)", "function refund(uint256 ticketId)",
   "function enqueue(uint32 qty,uint256 userDeadline,(bytes32 nonce,uint8 v,bytes32 r,bytes32 s) auth) returns (uint256)",
@@ -40,6 +43,7 @@ export const baseAbi = [
     "NotOrderOwner","NotQueued","WithdrawalUnavailable","TokenTransferFailed","RetryUnavailable","BindingPending"].map(name => "error " + name + "()"),
 ];
 export const watcherAbi = [
+  ...sponsorshipAbi.watcher,
   "function factory() view returns (address)",
   "function sourceState(address) view returns ((bool registered,uint256 revision,uint256 head,uint256 deadline,uint256 available,uint256 slot,uint256 lastCronAt,uint256 lastAnnouncementAt,uint256 paymentRetryAt,uint256 lastPaymentAt,uint8 paymentAttempts))",
   "event SourceBound(address indexed source)",
@@ -60,22 +64,20 @@ export const networks = {
     explorer: "https://lasna.reactscan.net", address: (import.meta.env.VITE_REACTIVE_ADDRESS || "").trim(),
     start: import.meta.env.VITE_LASNA_START_BLOCK, abi: new Interface(watcherAbi) },
 };
-const readers = new Map<Chain, JsonRpcProvider>();
-const verified = new Set<Chain>();
+const readers = new Map<Chain, Promise<JsonRpcProvider>>();
 
 export async function reader(chain: Chain) {
   const net = networks[chain];
-  let provider = readers.get(chain);
-  if (!provider) {
-    provider = new JsonRpcProvider(net.url, net.id, { staticNetwork: true, batchMaxCount: 1 });
-    readers.set(chain, provider);
+  let ready = readers.get(chain);
+  if (!ready) {
+    const provider = new JsonRpcProvider(net.url, net.id, { staticNetwork: true, batchMaxCount: 1 });
+    ready = provider.send("eth_chainId", []).then(id => {
+      if (Number(id) !== net.id) throw new Error("The configured RPC is on the wrong network.");
+      return provider;
+    }).catch(err => { readers.delete(chain); provider.destroy(); throw err; });
+    readers.set(chain, ready);
   }
-  if (!verified.has(chain)) {
-    const id = Number(await provider.send("eth_chainId", []));
-    if (id !== net.id) throw new Error("The configured RPC is on the wrong network.");
-    verified.add(chain);
-  }
-  return provider;
+  return ready;
 }
 
 export function contractAddress(chain: Chain) {
@@ -114,24 +116,47 @@ export async function readBaseBinding(rpc: Provider, source: string, blockTag: n
 
 export const firstTicketPage = { grant: 0n, offset: 0 };
 export type TicketCursor = typeof firstTicketPage;
-export async function readBase(source: string, account: string, cursor: TicketCursor) {
+export interface EventPreview {
+  name: string; location: string; description: string; cover: string; start: number; capacity: number; price: bigint;
+  sponsored: boolean;
+}
+// Only immutable metadata read from a factory-listed event can be reused between pages.
+const previews = new Map<string, EventPreview>();
+export const cachedPreview = (source: string) => previews.get(getAddress(source));
+async function readPreview(source: string, event: Contract, blockTag: number | "latest"): Promise<EventPreview> {
+  const known = cachedPreview(source);
+  if (known) return known;
+  const at = { blockTag };
+  const capability = event.sponsoredNonce(ZeroAddress, 1, 1, ZeroHash, at).then(() => true).catch((err: unknown) => {
+    // The public Base RPC reports an unknown selector on the legacy event with code 3 and no revert data.
+    if (isError(err, "CALL_EXCEPTION") && (err.data === "0x" ||
+      (err.data == null && /execution reverted/i.test(String(err.info?.error?.message))))) return false;
+    if (isError(err, "BAD_DATA") && err.value === "0x") return false;
+    throw err;
+  });
+  const [info, start, capacity, price, sponsored] = await Promise.all([event.details(at), event.eventStartTime(at), event.capacity(at), event.ticketPrice(at), capability]);
+  return { name: String(info.name), location: String(info.location), description: String(info.description), cover: coverUrl(info.cover),
+    start: Number(start), capacity: Number(capacity), price: BigInt(price), sponsored };
+}
+export async function readBase(source: string, account: string, cursor: TicketCursor, onPreview?: (preview: EventPreview) => void) {
   const rpc = await reader("base");
   const block = await rpc.getBlock("latest");
   if (!block) throw new Error("Base block unavailable.");
-  const binding = await readBaseBinding(rpc, source, block.number);
   const event = new Contract(source, baseAbi, rpc);
   const at = { blockTag: block.number };
-  const [metadata, capacity, price, start, available, publicSeats, state, page, count, organizer, proceeds, canRetry] = await Promise.all([
-    event.details(at), event.capacity(at), event.ticketPrice(at), event.eventStartTime(at), event.availableSpots(at),
+  const identity = Promise.all([readBaseBinding(rpc, source, block.number), readPreview(source, event, block.number)]).then(([binding, preview]) => {
+    previews.set(getAddress(source), preview);
+    onPreview?.(preview);
+    return { binding, preview };
+  });
+  const [{ binding, preview }, publicSeats, state, page, count, organizer, proceeds, canRetry] = await Promise.all([
+    identity,
     event.publicSpots(at), event.settlementState(at),
     account ? event.ticketsPage(account, cursor.grant, cursor.offset, at) : null,
     account ? event.ticketBalance(account, at) : 0n, event.organizer(at), event.retainedProceeds(at), event.canRetrySettlement(at),
   ]);
-  const headQty = state.head !== 0n ? Number((await event.orderInfo(state.head, at)).qty) : 0;
-  return { block, event: { binding, name: String(metadata.name), location: String(metadata.location),
-    description: String(metadata.description), cover: coverUrl(metadata.cover), capacity: Number(capacity), price: BigInt(price),
-    start: Number(start), available: Number(available), publicSeats: Number(publicSeats),
-    headQty, held: Number(state.heldSpots), blocked: Boolean(state.paymentBlocked), tickets: Array.from((page?.ids ?? []) as bigint[]),
+  return { block, event: { ...preview, binding, publicSeats: Number(publicSeats),
+    heldFor: String(state.head), held: Number(state.heldSpots), blocked: Boolean(state.paymentBlocked), tickets: Array.from((page?.ids ?? []) as bigint[]),
     ticketCount: BigInt(count), nextPage: page?.more ? { grant: BigInt(page.nextGrant), offset: Number(page.nextOffset) } : null,
     account, canRetry: Boolean(canRetry), organizer: String(organizer), proceeds: BigInt(proceeds) } };
 }
@@ -146,7 +171,7 @@ export async function readLasna(source: string) {
   const at = { blockTag: block.number };
   const [factory, state] = await Promise.all([contract.factory(at), contract.sourceState(source, at)]);
   return { address, source: getAddress(source), factory: String(factory), registered: Boolean(state.registered),
-    revision: BigInt(state.revision), active: state.slot !== 0n, deadline: Number(state.deadline), paymentRetryAt: Number(state.paymentRetryAt) };
+    revision: BigInt(state.revision), active: state.slot !== 0n };
 }
 
 export type Workshop = Awaited<ReturnType<typeof readBase>>["event"];
@@ -172,9 +197,9 @@ export async function readDirectory(page: number) {
   const items = await Promise.all(Array.from({ length: Math.min(6, top) }, async (_, i) => {
     const source: string = await factory.events(top - 1 - i);
     const event = new Contract(source, baseAbi, rpc);
-    const [info, date, price, seats] = await Promise.all([event.details(), event.eventStartTime(), event.ticketPrice(), event.publicSpots()]);
-    return { source, name: String(info.name), location: String(info.location), cover: coverUrl(info.cover),
-      date: Number(date), price: BigInt(price), seats: Number(seats) };
+    const [preview, seats] = await Promise.all([readPreview(source, event, "latest"), event.publicSpots()]);
+    previews.set(getAddress(source), preview);
+    return { source, ...preview, seats: Number(seats) };
   }));
   return { items, count };
 }

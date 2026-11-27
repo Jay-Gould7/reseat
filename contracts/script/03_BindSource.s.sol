@@ -9,8 +9,13 @@ contract BindSource is Script {
         require(block.chainid == 5318007, "Select Lasna");
         WaitlistReactive watcher = WaitlistReactive(payable(vm.envAddress("VITE_REACTIVE_ADDRESS")));
         address source = vm.envAddress("VITE_FACTORY_ADDRESS");
+        address relay = vm.envAddress("WAITLIST_RELAY_ADDRESS");
+        require(relay != address(0), "Set the Lasna enrollment relay address");
+        address bound = watcher.factory();
+        require(bound == address(0) || bound == source, "Different factory already bound");
         vm.startBroadcast(vm.envUint("DEPLOYER_PRIVATE_KEY"));
-        watcher.bindFactory(source);
+        if (bound == address(0)) watcher.bindFactory(source);
+        if (watcher.waitlistRelay() != relay) watcher.setWaitlistRelay(relay);
         vm.stopBroadcast();
         console2.log("Subscribed to Base Sepolia factory", source);
     }

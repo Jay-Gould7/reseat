@@ -3,7 +3,7 @@ pragma solidity ^0.8.29;
 
 import {AbstractCallback} from "@reactive/src/base/AbstractCallback.sol";
 import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
-import {ISettlement, EventDetails, PaymentRetries} from "./interfaces/ISettlement.sol";
+import {ISettlement, EventDetails, PaymentRetries, SponsoredJoin, SponsoredCancel} from "./interfaces/ISettlement.sol";
 import {IUSDC} from "./interfaces/IUSDC.sol";
 import {TicketBook} from "./TicketBook.sol";
 
@@ -13,6 +13,8 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     bytes32 private constant RECEIVE_TYPEHASH = keccak256(
         "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
     );
+    bytes32 private constant CANCEL_TYPEHASH = keccak256("CancelWaitlist(uint256 orderId,uint256 validBefore)");
+    bytes32 private immutable cancelDomain;
 
     enum Status {
         None,
@@ -70,7 +72,7 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     bytes32 private lastReport;
     mapping(bytes32 => bool) private retried;
     mapping(uint256 => Order) private orders;
-    mapping(address => mapping(bytes32 => bool)) public nonceRegistered;
+    mapping(address => mapping(bytes32 => uint256)) public orderIdForNonce;
 
     event BindingConfirmed(address indexed watcher);
     event TicketRefunded(uint256 indexed ticketId, address indexed buyer, uint256 amount);
@@ -109,6 +111,15 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
             "Invalid event terms"
         );
         factory = msg.sender;
+        cancelDomain = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("ReSeat"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
         organizer = organizer_;
         metadata = details_;
         eventStartTime = start_;
@@ -159,34 +170,88 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
     }
 
     function enqueue(uint32 qty, uint256 userDeadline, Signature calldata auth) external returns (uint256 id) {
+        return _enqueue(msg.sender, qty, userDeadline, auth);
+    }
+
+    function nonceRegistered(address buyer, bytes32 nonce) external view returns (bool) {
+        return orderIdForNonce[buyer][nonce] != 0;
+    }
+
+    /// @notice The Circle authorization also commits to joining this particular waitlist.
+    function sponsoredNonce(address buyer, uint32 qty, uint256 deadline, bytes32 salt) public view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode("ReSeat sponsored waitlist v1", block.chainid, address(this), buyer, qty, deadline, salt)
+            );
+    }
+
+    function enqueueSponsored(address reactive_, SponsoredJoin calldata order)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(reactive_)
+        returns (uint256)
+    {
+        bytes32 nonce = sponsoredNonce(order.buyer, order.qty, order.deadline, order.salt);
+        uint256 existing = orderIdForNonce[order.buyer][nonce];
+        if (existing != 0) return existing;
+        if (order.deadline > eventStartTime) revert InvalidAuthorization();
+        return _enqueue(order.buyer, order.qty, order.deadline, Signature(nonce, order.v, order.r, order.s));
+    }
+
+    function _enqueue(address buyer, uint32 qty, uint256 userDeadline, Signature memory auth)
+        private
+        returns (uint256 id)
+    {
         if (!automationReady) revert BindingPending();
         if (block.timestamp >= eventStartTime) revert EventStarted();
         if (qty == 0 || qty > capacity) revert InvalidQuantity();
         if (publicSpots() != 0) revert SalesAvailable();
         uint256 deadline = userDeadline < eventStartTime ? userDeadline : eventStartTime;
         if (
-            deadline <= block.timestamp || nonceRegistered[msg.sender][auth.nonce]
-                || usdc.authorizationState(msg.sender, auth.nonce)
+            buyer == address(0) || deadline <= block.timestamp || orderIdForNonce[buyer][auth.nonce] != 0
+                || usdc.authorizationState(buyer, auth.nonce)
         ) revert InvalidAuthorization();
         bytes32 body = keccak256(
-            abi.encode(RECEIVE_TYPEHASH, msg.sender, address(this), qty * ticketPrice, uint256(0), deadline, auth.nonce)
+            abi.encode(RECEIVE_TYPEHASH, buyer, address(this), qty * ticketPrice, uint256(0), deadline, auth.nonce)
         );
         bytes32 digest = keccak256(abi.encodePacked(hex"1901", usdc.DOMAIN_SEPARATOR(), body));
-        if (
-            uint256(auth.s) > 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0
-                || ecrecover(digest, auth.v, auth.r, auth.s) != msg.sender
-        ) revert InvalidAuthorization();
-        nonceRegistered[msg.sender][auth.nonce] = true;
+        _verify(buyer, digest, auth.v, auth.r, auth.s);
         id = nextId++;
-        orders[id] = Order(msg.sender, qty, Status.Queued, 0, deadline, 0, auth);
+        orderIdForNonce[buyer][auth.nonce] = id;
+        orders[id] = Order(buyer, qty, Status.Queued, 0, deadline, 0, auth);
         ++activeOrders;
-        emit Queued(id, msg.sender, qty, deadline);
+        emit Queued(id, buyer, qty, deadline);
     }
 
     function cancel(uint256 id) external {
-        Order storage order = orders[id];
-        if (order.buyer != msg.sender) revert NotOrderOwner();
-        if (order.status != Status.Queued) revert NotQueued();
+        if (orders[id].buyer != msg.sender) revert NotOrderOwner();
+        _cancel(id);
+    }
+
+    function cancelSponsored(address reactive_, SponsoredCancel calldata intent)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(reactive_)
+    {
+        uint256 id = intent.orderId;
+        bytes32 body = keccak256(abi.encode(CANCEL_TYPEHASH, id, intent.validBefore));
+        _verify(
+            orders[id].buyer, keccak256(abi.encodePacked(hex"1901", cancelDomain, body)), intent.v, intent.r, intent.s
+        );
+        if (orders[id].status == Status.Cancelled) return;
+        if (block.timestamp >= intent.validBefore) revert InvalidAuthorization();
+        _cancel(id);
+    }
+
+    function _verify(address buyer, bytes32 digest, uint8 v, bytes32 r, bytes32 s) private pure {
+        if (
+            buyer == address(0) || uint256(s) > 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0
+                || ecrecover(digest, v, r, s) != buyer
+        ) revert InvalidAuthorization();
+    }
+
+    function _cancel(uint256 id) private {
+        if (orders[id].status != Status.Queued) revert NotQueued();
         _resolve(id, Status.Cancelled);
         if (activeOrders == 0) headId = nextId;
         if (availableSpots != 0 && (id == headId || activeOrders == 0)) _report(Report.Changed);

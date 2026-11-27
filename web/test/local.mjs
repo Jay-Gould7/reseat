@@ -64,6 +64,9 @@ export async function platform(t) {
   const watcher = await deploy(await artifact("WaitlistReactive"), operatorL);
   const factory = await deploy(await artifact("EventFactory"), operator, proxy.target, watcher.target, parseEther("0.0001"));
   await mined(watcher.bindFactory(factory.target));
+  const relayer = await actor(lasna.rpc);
+  await mined(watcher.setWaitlistRelay(relayer.address));
+  await lasna.rpc.send("anvil_setBalance", [watcher.target, toBeHex(parseEther("1"))]);
   const eventArt = await artifact("EventWaitlist");
   const event = address => new Contract(address, eventArt.abi, operator);
 
@@ -79,47 +82,83 @@ export async function platform(t) {
     return mined(proxy.forward(destination, request.payload, sender, request.gasLimit));
   }
   const cursors = new Map();
+  let sponsoredCursor = 0n;
+  async function deliverSponsored(contract, method) {
+    const selector = contract.interface.getFunction(method).selector;
+    const end = Date.now() + 20_000;
+    while (Date.now() < end) {
+      const count = await system.requestCount();
+      while (sponsoredCursor < count) {
+        const index = sponsoredCursor++;
+        const [request] = await system.requestAt(index);
+        if (request.recipient === contract.target && request.payload.startsWith(selector)) return deliver(index, contract.target);
+      }
+      await delay(100);
+    }
+    throw new Error("No Lasna request for " + method);
+  }
   async function relayStates(contract) {
     const logs = await contract.queryFilter(contract.filters.SettlementState(), cursors.get(contract.target) ?? 0);
     for (const log of logs) await relay(log);
     if (logs.length) cursors.set(contract.target, logs.at(-1).blockNumber + 1);
   }
-  return { base, lasna, factory, watcher, token, system, proxy, event, relay, deliver, relayStates };
+  return { base, lasna, factory, watcher, token, system, proxy, event, relay, deliver, relayStates, relayer, deliverSponsored };
 }
 
-export async function walletPage(browser, platform, wallet, origin) {
+export async function walletPage(browser, platform, wallet, origin, { secondAccount, otherWallet, rejectWalletTransactions = false } = {}) {
   const context = await browser.newContext({ locale: "en-US", timezoneId: "UTC" });
   await context.route("https://covers.reseat.test/**", route => route.fulfill({ path: webRoot + "/public/workshop.jpg" }));
-  let connected = false;
-  let chain = platform.base;
-  const signatures = [];
-  await context.exposeFunction("requestLocalWallet", async ({ method, params = [] }) => {
-    if (method === "eth_requestAccounts") connected = true;
+  const stores = [[wallet, ...(secondAccount ? [secondAccount] : [])], ...(otherWallet ? [[otherWallet]] : [])]
+    .map(keys => ({ keys, authorized: [], chain: platform.base }));
+  const signatures = [], transactions = [];
+  await context.exposeFunction("requestLocalWallet", async ({ index, method, params = [] }) => {
+    const store = stores[index];
+    if (method === "eth_requestAccounts" && !store.authorized.length) store.authorized = [store.keys[0]];
+    if (method === "wallet_requestPermissions") {
+      assert.deepEqual(params, [{ eth_accounts: {} }]);
+      store.authorized = [...store.keys];
+      return [{ parentCapability: "eth_accounts" }];
+    }
     if (method === "wallet_switchEthereumChain") {
       const id = Number(params[0].chainId);
       assert.ok(id === 84532 || id === 5318007);
-      chain = id === 84532 ? platform.base : platform.lasna;
+      store.chain = id === 84532 ? platform.base : platform.lasna;
       return null;
     }
-    if (method === "eth_accounts" || method === "eth_requestAccounts") return connected ? [wallet.address] : [];
+    if (method === "eth_accounts" || method === "eth_requestAccounts") return store.authorized.map(key => key.address);
     if (method === "eth_signTypedData_v4") {
       const { domain, types, message } = JSON.parse(params[1]);
       delete types.EIP712Domain;
-      assert.equal(domain.verifyingContract.toLowerCase(), tokenAddress.toLowerCase());
+      if (types.ReceiveWithAuthorization) assert.equal(domain.verifyingContract.toLowerCase(), tokenAddress.toLowerCase());
+      else { assert.ok(types.CancelWaitlist); assert.equal(domain.name, "ReSeat"); assert.equal(await platform.factory.isEvent(domain.verifyingContract), true); }
       signatures.push(message);
-      return wallet.signTypedData(domain, types, message);
+      const signer = store.authorized.find(key => key.address.toLowerCase() === params[0].toLowerCase());
+      assert.ok(signer, "signature from an authorized account of this extension");
+      return signer.signTypedData(domain, types, message);
     }
     if (method === "eth_sendTransaction") {
       const [tx] = params;
-      assert.equal(tx.from.toLowerCase(), wallet.address.toLowerCase());
-      return (await wallet.connect(chain.rpc).sendTransaction({ to: tx.to, data: tx.data, value: tx.value || 0, gasLimit: tx.gas })).hash;
+      transactions.push(tx);
+      if (rejectWalletTransactions) throw new Error("Chain must support EIP-7702 for sponsored or gas included transaction");
+      const signer = store.authorized.find(key => key.address.toLowerCase() === tx.from.toLowerCase());
+      assert.ok(signer, "transaction from an authorized account of this extension");
+      return (await signer.connect(store.chain.rpc).sendTransaction({ to: tx.to, data: tx.data, value: tx.value || 0, gasLimit: tx.gas })).hash;
     }
-    return chain.rpc.send(method, params);
+    return store.chain.rpc.send(method, params);
   });
-  await context.addInitScript(() => { window.ethereum = { request: window.requestLocalWallet }; });
+  await context.addInitScript(multiple => {
+    const providers = [0, 1].map(index => ({ request: args => window.requestLocalWallet({ index, ...args }) }));
+    window.ethereum = providers[0];
+    if (multiple) window.addEventListener("eip6963:requestProvider", () => providers.forEach((provider, index) => {
+      window.dispatchEvent(new CustomEvent("eip6963:announceProvider", { detail: { provider, info: {
+        uuid: "00000000-0000-4000-8000-00000000000" + index, rdns: "test.wallet" + index, name: index ? "Wallet Two" : "Wallet One",
+      } } }));
+    }));
+  }, Boolean(otherWallet));
   const page = await context.newPage();
   await page.goto(origin);
   await page.getByRole("button", { name: "Connect Wallet", exact: true }).click();
+  if (otherWallet) await page.getByRole("dialog").getByRole("button", { name: "Wallet One", exact: true }).click();
   await page.getByText("Wallet connected.", { exact: true }).waitFor();
-  return { wallet, page, signatures };
+  return { wallet, page, signatures, transactions };
 }

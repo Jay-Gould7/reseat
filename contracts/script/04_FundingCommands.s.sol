@@ -14,5 +14,7 @@ contract FundingCommands is Script {
         console2.log(
             'cast send --interactive --rpc-url "$BASE_SEPOLIA_RPC_URL" "$BASE_CALLBACK_PROXY" "depositTo(address)" "$EVENT_ADDRESS" --value 0.01ether'
         );
+        console2.log("Fund the separate Lasna relay wallet for submitting guest signatures (example 0.1 test REACT):");
+        console2.log('cast send --interactive --rpc-url "$LASNA_RPC_URL" "$WAITLIST_RELAY_ADDRESS" --value 0.1ether');
     }
 }

@@ -10,9 +10,11 @@ async function openPlatform(t) {
   const port = await freePort();
   const origin = "http://127.0.0.1:" + port;
   Object.assign(process.env, { VITE_BASE_RPC_URL: p.base.url, VITE_LASNA_RPC_URL: p.lasna.url,
+    BASE_SEPOLIA_RPC_URL: p.base.url, LASNA_RPC_URL: p.lasna.url, WAITLIST_RELAY_PRIVATE_KEY: p.relayer.privateKey,
     VITE_FACTORY_ADDRESS: p.factory.target, VITE_REACTIVE_ADDRESS: p.watcher.target,
     VITE_BASE_START_BLOCK: "0", VITE_LASNA_START_BLOCK: "0" });
-  const server = await createServer({ root: webRoot, logLevel: "error", server: { host: "127.0.0.1", port, strictPort: true } });
+  const server = await createServer({ root: webRoot, cacheDir: "node_modules/.vite-reseat-tests", logLevel: "error",
+    server: { host: "127.0.0.1", port, strictPort: true } });
   await server.listen(); t.after(() => server.close());
   const browser = await chromium.launch({ headless: true, executablePath: process.env.RESEAT_BROWSER });
   t.after(() => browser.close());
@@ -53,7 +55,7 @@ test("publish and share two independent events, activate, reserve and recover pa
   await mobile.getByText("Studio Morning Lab", { exact: true }).waitFor();
   assert.equal(await mobile.locator("img.poster").getAttribute("src"), "https://covers.reseat.test/poster.jpg");
   assert.equal(await mobile.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
-  assert.equal(await mobile.getByRole("button", {name:"Connect Wallet",exact:true}).count() > 0,true);
+  assert.ok(await mobile.locator("header").getByRole("button", {name:"连接钱包",exact:true}).isVisible());
 
   async function refresh(page) {
     await Promise.all([p.base.rpc.send("anvil_mine", ["0x3"]), p.lasna.rpc.send("anvil_mine", ["0x2"])]);
@@ -112,6 +114,7 @@ test("publish and share two independent events, activate, reserve and recover pa
     await user.page.getByText("Automatic waitlist ready", {exact:true}).waitFor();
     await user.page.getByLabel("Ticket quantity", {exact:true}).fill(String(qty));
     await user.page.getByRole("button", {name:"Sign & join waitlist"}).click();
+    await p.deliverSponsored(target, "enqueueSponsored");
     await user.page.getByText("Your order is confirmed on the waitlist.", {exact:true}).waitFor();
     assert.equal(user.signatures.length,1);
     assert.equal(user.signatures[0].to.toLowerCase(),target.target.toLowerCase());
@@ -125,8 +128,11 @@ test("publish and share two independent events, activate, reserve and recover pa
   }
   await refund(hostA,a,"20"); await refund(hostB,b,"7.5");
   await refresh(mobile);
-  await mobile.getByText("已暂留 1 张，还差 1 张，尚未扣款", {exact:true}).waitFor();
+  await refresh(lin.page);
+  await lin.page.getByRole("region", { name: "My waitlist orders" }).getByText("Holding 1 seat · 1 more needed. No USDC charged.", {exact:true}).waitFor();
   await mobile.getByText("候补已就绪", {exact:true}).waitFor();
+  assert.equal(await mobile.getByText(/已暂留|还差|订单 #/).count(), 0);
+  assert.equal(await mobile.getByRole("heading", {name:"我的候补订单"}).count(), 0);
   assert.equal(await mobile.getByRole("link", { name: "发布活动", exact: true }).count(), 1);
   const bRevision = (await p.watcher.sourceState(b.target)).revision;
   const pending = await p.system.requestCount();
@@ -153,16 +159,18 @@ test("publish and share two independent events, activate, reserve and recover pa
   assert.equal((await p.watcher.sourceState(b.target)).revision,bRevision); assert.equal(await p.watcher.cronActive(),true);
   assert.equal(await p.token.balanceOf(mei.wallet.address),22_500_000n);
   await refresh(mobile);
-  await mobile.getByText("2 tickets issued to order #1 · first ID #3", {exact:true}).waitFor();
+  await mobile.getByText("候补已自动出票", {exact:true}).waitFor();
   await mobile.getByRole("button", {name:"Lasna",exact:true}).click();
-  await mobile.getByText("CRON requested payment retry 1 for order #1", {exact:true}).waitFor();
-  await mobile.getByText("Deadline tracking stopped for this event", {exact:true}).first().waitFor();
-  assert.equal(await mobile.getByText("CRON unsubscribed", {exact:true}).count(), 0);
+  await mobile.getByText("已请求自动重试收款", {exact:true}).waitFor();
+  await mobile.getByText("本场活动已停止检查候补截止时间", {exact:true}).first().waitFor();
+  const retryLog = mobile.locator("#activity li").filter({ hasText: "已请求自动重试收款" });
+  assert.match(await retryLog.getByRole("link", { name: "Reactscan" }).getAttribute("href"), /^https:\/\/lasna\.reactscan\.net\/tx\/0x/);
+  assert.doesNotMatch(await mobile.locator("#activity").innerText(), /订单\s*#|order\s*#|CRON|暂留\s*\d/i);
   await mobile.goto(origin); await mobile.getByRole("heading",{name:"Morning Lab"}).waitFor();
   await mobile.getByRole("heading",{name:"Evening Studio"}).waitFor();
 });
 
-test("open queue uses Base time, complete history and all pages without a refund", { timeout: 90_000 }, async t => {
+test("public total and private ranks use the full live queue and Base time without a refund", { timeout: 120_000 }, async t => {
   const { p, browser, origin } = await openPlatform(t);
   const seller = await actor(p.base.rpc);
   const buyerB = await actor(p.base.rpc);
@@ -196,43 +204,48 @@ test("open queue uses Base time, complete history and all pages without a refund
   }
   await p.base.rpc.send("anvil_mine", ["0x3"]);
   const page = await browser.newPage({ locale: "zh-CN" });
-  let releaseHistory;
-  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
-  t.after(() => releaseHistory());
+  let releaseOrder;
+  const gate = new Promise(resolve => { releaseOrder = resolve; });
+  t.after(() => releaseOrder());
   await page.route(p.base.url + "/**", async route => {
-    if (route.request().postDataJSON()?.method === "eth_getLogs") await historyGate;
+    const call = route.request().postDataJSON();
+    if (call?.method === "eth_call" && call.params[0].data === event.interface.encodeFunctionData("orderInfo", [7])) await gate;
     await route.continue();
   });
-  await page.goto(origin + "/?event=" + event.target);
+  const url = origin + "/?event=" + event.target;
+  await page.goto(url);
   const queue = page.locator("#waitlist");
-  const rows = queue.locator(".order-list li");
-  await queue.getByText("Reading orders…", { exact: true }).waitFor();
-  assert.equal(await queue.locator(".count-label").innerText(), "Reading orders…");
-  assert.equal(await rows.count(), 0);
-  releaseHistory();
-  await queue.getByText("7 open", { exact: true }).waitFor();
-  assert.equal(await rows.count(), 5);
+  const total = queue.getByRole("status");
+  await total.getByText("读取中…").waitFor();
+  releaseOrder();
+  await total.getByText("7", { exact: true }).waitFor();
+  assert.equal(await queue.getByRole("button").count(), 0);
+  const b = (await walletPage(browser, p, buyerB, url)).page, c = (await walletPage(browser, p, buyerC, url)).page;
+  const mineB = b.getByRole("region", {name:"My waitlist orders"}), mineC = c.getByRole("region", {name:"My waitlist orders"});
+  await mineC.getByText("Queue position #2", {exact:true}).waitFor();
+  await mineB.getByRole("button", {name:"Show more orders"}).click();
+  assert.equal(await mineB.locator("article").count(), 6);
   await p.base.rpc.send("evm_setNextBlockTimestamp", [deadline]);
   await p.base.rpc.send("evm_mine", []);
   assert.equal(Number((await p.base.rpc.send("eth_getBlockByNumber", ["latest", false])).timestamp), deadline);
-  // Let the open page observe the deadline on its next eight-second poll.
-  await queue.getByText("1 open", { exact: true }).waitFor();
-  assert.equal(await rows.count(), 1);
-  assert.match(await rows.first().innerText(), /Order #2/);
-  assert.equal(await rows.first().getByLabel("Queue position").textContent(), "#1");
+  // Let the open pages observe the exact deadline without a refund or settlement.
+  await total.getByText("1", { exact: true }).waitFor();
+  await mineC.getByText("Queue position #1", {exact:true}).waitFor();
+  assert.equal(await mineC.getByText("Order #1", {exact:true}).count(), 0);
   assert.equal(await event.activeOrders(), 7n);
-  await queue.getByRole("button", { name: "All orders" }).click();
-  const rowB = rows.filter({ hasText: "Order #1 ·" });
-  await rowB.getByText("已过截止时间", { exact: true }).waitFor();
-  assert.equal(await rowB.getByLabel("Queue position").textContent(), "–");
+  await mineB.getByRole("button", {name:"History", exact:true}).click();
+  await mineB.getByRole("button", {name:"Show more orders"}).click();
+  const rowB = mineB.locator("article").filter({has: b.getByRole("heading", {name:"Order #1", exact:true})});
+  await rowB.getByText("Deadline passed", {exact:true}).waitFor();
+  assert.equal(await rowB.getByRole("button").count(), 0);
 
   // A later refund gives Base a reason to resolve the expired head on-chain.
   await mined(event.connect(seller).refund(1));
   await p.relayStates(event);
   await p.deliver(1, event.target);
   await p.base.rpc.send("anvil_mine", ["0x3"]);
-  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
-  await rowB.getByText("已确认过期", { exact: true }).waitFor();
+  await b.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+  await rowB.getByText("Expired on Base", {exact:true}).waitFor();
   assert.equal(await event.ticketBalance(buyerC.address), 1n);
 });
 
@@ -275,4 +288,221 @@ test("top up the Lasna watcher and an event's Base proxy credit from the funding
 
   const budgets = await server.ssrLoadModule("/src/feeBudget.ts");
   await assert.rejects(budgets.readFunding("event", host.address), /Choose an event published by this factory/);
+});
+
+test("mobile navigation shows the selected event before its live inventory arrives", { timeout: 90_000 }, async t => {
+  const { p, browser, origin } = await openPlatform(t);
+  const host = await actor(p.base.rpc);
+  const start = (await p.base.rpc.getBlock("latest")).timestamp + 86400;
+  for (const name of ["First Studio", "Next Studio"]) {
+    await mined(p.factory.connect(host).createEvent([name, name + " venue", "", ""], start, 3, 2_000_000n, { value: await p.factory.callbackDeposit() }));
+  }
+  const event = p.event(await p.factory.events(0));
+  const page = await browser.newPage({ locale: "zh-CN", viewport: { width: 390, height: 844 } });
+  await page.goto(origin);
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  assert.deepEqual(await nav.getByRole("link").allTextContents(), ["首页", "活动"]);
+  await page.evaluate(() => { window.reseatPageMarker = "same document"; });
+  await nav.getByRole("link", { name: "活动", exact: true }).click();
+  await page.getByRole("heading", { name: "活动", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "First Studio" }).waitFor();
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  t.after(release);
+  await page.route(p.base.url + "/**", async route => {
+    const call = route.request().postDataJSON();
+    if (call?.method === "eth_call" && call.params[0].data === event.interface.encodeFunctionData("settlementState")) await gate;
+    await route.continue();
+  });
+  await page.getByRole("link", { name: /First Studio/ }).click();
+  await page.getByRole("heading", { name: "First Studio", level: 1 }).waitFor();
+  await page.getByText("正在读取本场活动的可售票数…").waitFor();
+  assert.equal(await page.getByRole("heading", { name: "Next Studio" }).count(), 0);
+  assert.deepEqual(await nav.getByRole("link").allTextContents(), ["首页", "活动"]);
+  assert.equal(await page.locator(".registration").count(), 0);
+  await page.goBack();
+  await page.getByRole("heading", { name: "活动", exact: true }).waitFor();
+  await page.goForward();
+  await page.getByRole("heading", { name: "First Studio", level: 1 }).waitFor();
+  release();
+  await page.locator(".registration").getByText("可售 3 张 · 共 3 张").waitFor();
+  assert.equal(await page.evaluate(() => window.reseatPageMarker), "same document");
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+});
+
+test("two zero-ETH accounts join and cancel with event credit across wallet extensions", { timeout: 120_000 }, async t => {
+  const { p, browser, origin } = await openPlatform(t);
+  const host = await actor(p.base.rpc), first = await actor(p.base.rpc);
+  const buyer = await actor(p.base.rpc), other = await actor(p.base.rpc);
+  const start = (await p.base.rpc.getBlock("latest")).timestamp + 86400;
+  const price = 20_000_000n;
+  await mined(p.factory.connect(host).createEvent(["Account Lab", "", "", ""], start, 2, price, { value: await p.factory.callbackDeposit() }));
+  const event = p.event(await p.factory.events(0));
+  await p.relay((await p.factory.queryFilter(p.factory.filters.EventCreated()))[0]);
+  await p.deliver(0, event.target);
+  await p.relayStates(event);
+  await mined(p.token.mint(host.address, price * 2n));
+  await mined(p.token.connect(host).approve(event.target, price * 2n));
+  await mined(event.connect(host).buy(2));
+  await mined(p.token.mint(buyer.address, price * 2n));
+  await mined(p.token.mint(other.address, price));
+
+  const url = origin + "/?event=" + event.target;
+  await p.base.rpc.send("anvil_setBalance", [buyer.address, "0x0"]);
+  await p.base.rpc.send("anvil_setBalance", [other.address, "0x0"]);
+  await p.base.rpc.send("anvil_setCode", [other.address, "0xef0100d6cedde84be40893d153be9d467cd6ad37875b28"]);
+  const fee = parseEther("0.000005");
+  await mined(p.proxy.setDeliveryFee(fee));
+  const credit = await p.proxy.reserves(event.target);
+  const { page, transactions, signatures } = await walletPage(browser, p, first, url, { secondAccount: buyer, otherWallet: other, rejectWalletTransactions: true });
+  await page.setViewportSize({ width: 320, height: 780 });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  const switcher = page.getByRole("button", { name: "Switch wallet or account" });
+  const dialog = page.getByRole("dialog");
+  const mine = page.getByRole("region", { name: "My waitlist orders" });
+  let releaseHistory, releaseQueue;
+  const historyGate = new Promise(resolve => { releaseHistory = resolve; });
+  const queueGate = new Promise(resolve => { releaseQueue = resolve; });
+  t.after(() => { releaseHistory(); releaseQueue(); });
+  await page.route(p.base.url + "/**", async route => {
+    const call = route.request().postDataJSON();
+    if (call?.method === "eth_getLogs") await historyGate;
+    if (call?.method === "eth_call" && call.params[0].data === event.interface.encodeFunctionData("nextId")) await queueGate;
+    await route.continue();
+  });
+  async function selectExtension(name) {
+    await switcher.click();
+    await dialog.getByRole("button", { name, exact: true }).click();
+  }
+  async function join(qty) {
+    await page.getByText("Automatic waitlist ready", { exact: true }).waitFor();
+    await page.getByLabel("Ticket quantity", { exact: true }).fill(String(qty));
+    await page.getByRole("button", { name: "Sign & join waitlist" }).click();
+    await page.getByText("The event is paying the fee. Waiting for Base confirmation…", { exact: true }).waitFor();
+    assert.equal(await page.getByText("Your order is confirmed on the waitlist.", { exact: true }).count(), 0);
+    await p.deliverSponsored(event, "enqueueSponsored");
+    await mine.getByRole("button", { name: "Cancel waitlist order" }).waitFor();
+  }
+  await switcher.click();
+  await dialog.getByRole("button", { name: "Choose accounts in wallet" }).click();
+  await dialog.getByRole("button", { name: buyer.address, exact: true }).click();
+  await join(2);
+  await mine.getByText("2 tickets · 40 USDC", { exact: true }).waitFor();
+  assert.equal((await event.orderInfo(1)).buyer, buyer.address);
+  releaseQueue();
+
+  await selectExtension("Wallet Two");
+  await mine.getByText("No active waitlist orders for this wallet.", { exact: true }).waitFor();
+  await join(1);
+  await mine.getByText("Order #2", { exact: true }).waitFor();
+  assert.equal((await event.orderInfo(2)).buyer, other.address);
+  assert.equal(await mine.getByText("Order #1", { exact: true }).count(), 0);
+  await mined(event.connect(host).refund(1));
+  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+  await page.locator(".registration").getByText("0 available · 2 total", {exact:true}).waitFor();
+  await mine.getByText("Queue position #2", {exact:true}).waitFor();
+  assert.doesNotMatch(await page.locator("main").innerText(), /Holding 1 seat|Order #1|Resend waitlist status|Organizer tools|head deadline/i);
+  const {page: hostPage, signatures: hostSignatures} = await walletPage(browser, p, host, url);
+  const hostNonce = await p.base.rpc.getTransactionCount(host.address);
+  await hostPage.getByText("Organizer tools", {exact:true}).click();
+  await hostPage.getByText(/Your wallet will confirm a Base transaction and pay gas/).waitFor();
+  assert.equal(await p.base.rpc.getTransactionCount(host.address), hostNonce);
+  assert.equal(await hostPage.getByText(/Holding 1 seat|Order #1/).count(), 0);
+  await hostPage.getByRole("button", {name:"Resend waitlist status", exact:true}).click();
+  await hostPage.getByText("Waitlist status republished on Base.", {exact:true}).waitFor();
+  assert.equal(await p.base.rpc.getTransactionCount(host.address), hostNonce + 1);
+  assert.equal(hostSignatures.length, 0);
+  assert.equal(await p.token.balanceOf(buyer.address), price * 2n);
+  await page.getByRole("navigation").getByRole("link", { name: "Events" }).click();
+  await page.getByRole("link", { name: /Account Lab/ }).getByText("0 available · 2 total").waitFor();
+  await page.getByRole("link", { name: /Account Lab/ }).click();
+  await selectExtension("Wallet One");
+  await mine.getByText("Order #1", { exact: true }).waitFor();
+  await mine.getByText("Holding 1 seat · 1 more needed. No USDC charged.", {exact:true}).waitFor();
+  // A fresh read must find an old pending order even when all public Base history stays blocked.
+  await p.base.rpc.send("anvil_mine", ["0x180"]);
+  await page.reload();
+  await mine.getByRole("button", { name: "Cancel waitlist order" }).click();
+  await p.deliverSponsored(event, "cancelSponsored");
+  await page.getByText("Your waitlist order was cancelled.", {exact:true}).waitFor();
+  await mine.getByRole("button", {name:"History",exact:true}).click();
+  await mine.getByText("Cancelled", { exact: true }).waitFor();
+  assert.equal((await event.orderInfo(1)).status, 4n);
+  assert.equal((await event.orderInfo(2)).status, 1n);
+  assert.equal(await p.proxy.reserves(event.target), credit - 3n * fee);
+  assert.equal(await p.base.rpc.getBalance(buyer.address), 0n);
+  assert.equal(await p.base.rpc.getBalance(other.address), 0n);
+  assert.equal(transactions.length, 0);
+  assert.equal(signatures.length, 3);
+  assert.equal(await p.token.balanceOf(buyer.address), price * 2n);
+  assert.equal(await mine.getByRole("button", { name: "Cancel waitlist order" }).count(), 0);
+  await page.reload();
+  await mine.getByRole("button", {name:"History",exact:true}).click();
+  await mine.getByText("Cancelled", { exact: true }).waitFor();
+  releaseHistory();
+});
+
+test("funding gates signatures and a pending entry survives reload and duplicate submission", { timeout: 120_000 }, async t => {
+  const { p, browser, origin } = await openPlatform(t);
+  const host = await actor(p.base.rpc), buyer = await actor(p.base.rpc);
+  const start = (await p.base.rpc.getBlock("latest")).timestamp + 86400;
+  const price = 2_000_000n, credit = await p.factory.callbackDeposit();
+  await mined(p.factory.connect(host).createEvent(["Sponsored Lab", "", "", ""], start, 1, price, { value: credit }));
+  const event = p.event(await p.factory.events(0));
+  await mined(p.proxy.setDeliveryFee(credit));
+  await p.relay((await p.factory.queryFilter(p.factory.filters.EventCreated()))[0]);
+  await p.deliver(0, event.target);
+  await p.relayStates(event);
+  await mined(p.token.mint(host.address, price));
+  await mined(p.token.connect(host).approve(event.target, price));
+  await mined(event.connect(host).buy(1));
+  await mined(p.token.mint(buyer.address, price));
+  await p.base.rpc.send("anvil_setBalance", [buyer.address, "0x0"]);
+  const { page, signatures, transactions } = await walletPage(browser, p, buyer, origin + "/?event=" + event.target, { rejectWalletTransactions: true });
+  await page.getByText("The host needs to replenish this event’s Base callback credit.", { exact: true }).waitFor();
+  assert.ok(await page.locator(".registration .primary").isDisabled());
+  assert.equal(signatures.length, 0);
+  await mined(p.proxy.depositTo(event.target, { value: 3n * credit }));
+  await mined(p.watcher.setWaitlistRelay(host.address));
+  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+  await page.getByText("The ReSeat relay is unavailable. The operator can restore sponsorship.", { exact: true }).waitFor();
+  assert.ok(await page.locator(".registration .primary").isDisabled());
+  await mined(p.watcher.setWaitlistRelay(p.relayer.address));
+  await page.evaluate(() => window.dispatchEvent(new Event("reseat:confirmed")));
+
+  const endpoint = origin + "/api/waitlist/" + event.target;
+  const post = body => fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const firstResponse = page.waitForResponse(r => r.url() === endpoint && r.request().method() === "POST");
+  await page.getByRole("button", { name: "Sign & join waitlist" }).click();
+  const response = await firstResponse;
+  assert.equal(response.status(), 202);
+  const signed = response.request().postDataJSON();
+  const original = await response.json(), before = await p.system.requestCount();
+  assert.deepEqual(await (await post(signed)).json(), original);
+  assert.equal((await post({ ...signed, deadline: signed.deadline - 10 })).status, 422);
+  assert.equal(await p.system.requestCount(), before);
+  assert.equal(await event.activeOrders(), 0n);
+  await page.getByText("The event is paying the fee. Waiting for Base confirmation…", { exact: true }).waitFor();
+  await page.reload();
+  await page.getByRole("button", { name: "Check pending entry" }).click();
+  await page.getByText("The event is paying the fee. Waiting for Base confirmation…", { exact: true }).waitFor();
+  assert.equal(signatures.length, 1);
+  await p.deliverSponsored(event, "enqueueSponsored");
+  await page.getByText("Your order is confirmed on the waitlist.", { exact: true }).waitFor();
+  assert.equal((await (await post(signed)).json()).status, "confirmed");
+  assert.equal(await event.nextId(), 2n);
+  assert.equal(await p.system.requestCount(), before);
+  assert.equal(await p.proxy.reserves(event.target), 2n * credit);
+  assert.equal(await p.token.balanceOf(buyer.address), price);
+  assert.equal(transactions.length, 0);
+
+  const legacy = await browser.newPage({ locale: "zh-CN" });
+  const selector = event.interface.getFunction("sponsoredNonce").selector;
+  await legacy.route(p.base.url + "/**", route => {
+    const call = route.request().postDataJSON();
+    if (call?.method !== "eth_call" || !call.params[0].data.startsWith(selector)) return route.continue();
+    return route.fulfill({ json: { jsonrpc: "2.0", id: call.id, error: { code: 3, message: "execution reverted" } } });
+  });
+  await legacy.goto(origin + "/?event=" + event.target);
+  await legacy.getByText("这场旧版活动加入和取消候补都需要钱包发交易并支付 Base 手续费。", { exact: true }).waitFor();
 });

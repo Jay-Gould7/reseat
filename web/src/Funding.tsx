@@ -4,9 +4,10 @@ import { ExternalLink, Wallet } from "lucide-react";
 import { localText as t, networks, shortAddress } from "./chain";
 import { fundBudget, fundChain, nativeAmount, readFunding, type Fund } from "./feeBudget";
 import { usePolling } from "./useWorkshop";
+import { AppLink, navigate } from "./navigation";
 import type { Session } from "./App";
 
-function FundCard({ fund, source, account, busy, connect, run, notify }: Session & { fund: Fund; source: string | null }) {
+function FundCard({ fund, source, account, busy, connect, run, notify, getSigner }: Session & { fund: Fund; source: string | null }) {
   const chain = fundChain(fund), net = networks[chain], unit = chain === "base" ? "ETH" : "lREACT";
   const load = useCallback(() => readFunding(fund, source), [fund, source]);
   const { data, error } = usePolling(load);
@@ -16,7 +17,7 @@ function FundCard({ fund, source, account, busy, connect, run, notify }: Session
   const success = t("Funding confirmed.", "充值已确认。");
   return <section className="panel funding-card" aria-label={title}>
     <div className="section-heading"><h2>{title}</h2><span className="pill pill-blue">{net.label}</span></div>
-    <p>{fund === "event" ? t("Pays for this event’s waitlist callbacks.", "支付本场活动的候补回调费。") :
+    <p>{fund === "event" ? t("Pays for automatic seating and, on sponsorship-enabled events, for guests to join or cancel.", "用于自动补票；支持代付的活动也从这里支付来宾加入和取消候补的手续费。") :
       t("Pays for Lasna execution across all events.", "支付所有活动在 Lasna 上的执行费。")}</p>
     {error && <p role="status" className="problem">{error}</p>}
     {!data ? !error && <p role="status">{t("Reading chain balance…", "正在读取链上余额…")}</p> : <>
@@ -33,7 +34,7 @@ function FundCard({ fund, source, account, busy, connect, run, notify }: Session
         if (error || !value) return;
         void run(async () => {
           notify(t("Confirm the top-up on ", "请在钱包中确认充值到 ") + net.label);
-          const hash = await fundBudget(fund, source, data, value, account, notify);
+          const hash = await fundBudget(fund, source, data, value, getSigner, notify);
           setAmount(""); return hash;
         }, success, chain);
       }}>
@@ -50,15 +51,25 @@ function FundCard({ fund, source, account, busy, connect, run, notify }: Session
 
 export function Funding({ source, ...session }: Session & { source: string | null }) {
   const valid = source && isAddress(source);
-  return <div className="directory"><div className="directory-title"><a className="text-action" href={valid ? "?event=" + source : "?"}>
-    {valid ? t("Back to event", "返回活动") : t("All events", "所有活动")}</a>
+  return <div className="directory"><div className="directory-title"><AppLink className="text-action" href={valid ? "?event=" + source : "?events"}>
+    {valid ? t("Back to event", "返回活动") : t("All events", "所有活动")}</AppLink>
     <h1>{t("Automation funding", "自动化运行经费")}</h1></div>
     <div className="funding-grid">{valid ? <FundCard {...session} fund="event" source={source} /> :
       <section className="panel funding-card"><div className="section-heading"><h2>{t("Event callbacks", "本场活动回调")}</h2><Wallet size={20} /></div>
-        <form className="publish-form" method="get"><input type="hidden" name="funding" value="" />
-          <label>{t("Base event address", "Base 活动地址")}<input name="event" placeholder="0x…" pattern="0x[0-9a-fA-F]{40}" required /></label>
+        <form className="publish-form" method="get" onSubmit={e => {
+          e.preventDefault();
+          const event = String(new FormData(e.currentTarget).get("event") || "").trim();
+          if (isAddress(event)) navigate("?funding&event=" + event);
+          else {
+            const field = e.currentTarget.elements.namedItem("event") as HTMLInputElement;
+            field.setCustomValidity(t("Check the event address.", "请核对活动合约地址。"));
+            field.reportValidity();
+          }
+        }}><input type="hidden" name="funding" value="" />
+          <label>{t("Base event address", "Base 活动地址")}<input name="event" placeholder="0x…" pattern="0x[0-9a-fA-F]{40}" required
+            onInput={e => e.currentTarget.setCustomValidity("")} /></label>
           <button className="secondary">{t("View event balance", "查看活动余额")}</button></form>
-        <a className="text-action" href="?">{t("Browse events", "浏览活动")}</a></section>}
+        <AppLink className="text-action" href="?events">{t("Browse events", "浏览活动")}</AppLink></section>}
       <FundCard {...session} fund="watcher" source={null} />
     </div></div>;
 }

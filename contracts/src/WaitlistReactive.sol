@@ -3,7 +3,13 @@ pragma solidity ^0.8.29;
 
 import {AbstractReactive} from "@reactive/src/base/AbstractReactive.sol";
 import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
-import {ISettlement, IEventDirectory, PaymentRetries} from "./interfaces/ISettlement.sol";
+import {
+    ISettlement,
+    IEventDirectory,
+    PaymentRetries,
+    SponsoredJoin,
+    SponsoredCancel
+} from "./interfaces/ISettlement.sol";
 
 contract WaitlistReactive is AbstractReactive {
     uint256 public constant BASE_CHAIN_ID = 84532;
@@ -28,11 +34,16 @@ contract WaitlistReactive is AbstractReactive {
     }
     address public immutable owner = msg.sender;
     address public factory;
+    address public waitlistRelay;
+    mapping(bytes32 => uint256) public relayRetryAt;
     mapping(address => Source) private sources;
     address[] private tracked;
     uint256 private cursor;
 
     event SourceBound(address indexed source);
+    event WaitlistRelayChanged(address indexed relay);
+    event EnrollmentRequested(address indexed source, address indexed buyer, bytes32 indexed salt);
+    event CancellationRequested(address indexed source, uint256 indexed orderId);
     event CronChanged(address indexed source, bool active, uint256 headId, uint256 deadline, bool subscriptionChanged);
     event SettlementRequested(
         address indexed source, uint256 indexed headId, bool fromCron, bytes32 indexed sourceTx, uint8 paymentAttempt
@@ -46,6 +57,32 @@ contract WaitlistReactive is AbstractReactive {
 
     function sourceState(address source) external view returns (Source memory) {
         return sources[source];
+    }
+
+    function setWaitlistRelay(address relay) external {
+        require(msg.sender == owner, "Only owner");
+        waitlistRelay = relay;
+        emit WaitlistRelayChanged(relay);
+    }
+
+    function requestEnrollment(address source, SponsoredJoin calldata order) external {
+        bytes32 key = keccak256(abi.encode(source, order.buyer, order.salt));
+        _authorizeRequest(source, order.deadline, key);
+        _request(source, abi.encodeCall(ISettlement.enqueueSponsored, (address(0), order)));
+        emit EnrollmentRequested(source, order.buyer, order.salt);
+    }
+
+    function requestCancellation(address source, SponsoredCancel calldata intent) external {
+        _authorizeRequest(source, intent.validBefore, keccak256(abi.encode(source, intent.orderId)));
+        _request(source, abi.encodeCall(ISettlement.cancelSponsored, (address(0), intent)));
+        emit CancellationRequested(source, intent.orderId);
+    }
+
+    function _authorizeRequest(address source, uint256 deadline, bytes32 key) private {
+        require(msg.sender == waitlistRelay, "Only waitlist relay");
+        require(sources[source].revision != 0 && block.timestamp < deadline, "Request unavailable");
+        require(block.timestamp >= relayRetryAt[key], "Delivery pending");
+        relayRetryAt[key] = block.timestamp + 5 minutes;
     }
 
     function cronActive() external view returns (bool) {
