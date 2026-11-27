@@ -78,7 +78,7 @@ On that fork a standard EOA and a MetaMask EIP-7702 account delegated to `0x63c0
 
 ## Deploy the platform once
 
-The addresses in the testnet table belong to the earlier `23e89b3` deployment. Its **0.0001 test ETH** per-event deposit pays for automated callbacks. Its events require wallet transactions for entry and cancellation. The frontend labels these events as wallet-paid. Sponsorship requires a new watcher and factory, and events published through that factory. Event contracts are immutable.
+The public settings in `.env.example` point to the sponsorship-enabled `ab375d9` deployment. Publishing an event deposits **0.0001 Base test ETH** into that event's callback reserve. Shared links from the earlier `23e89b3` platform still use their original contracts and wallet-paid entry and cancellation.
 
 For a fresh platform, set `LASNA_RPC_URL`, `BASE_SEPOLIA_RPC_URL`, the Base callback proxy and Circle test USDC. `BASE_EVENT_CALLBACK_WEI` sets the per-event reserve and defaults to **0.0001 test ETH**. Actual callback fees determine how many requests it covers. Set `WAITLIST_RELAY_ADDRESS` to a dedicated Lasna wallet and fund it with test lREACT for forwarding transactions. Keep its matching `WAITLIST_RELAY_PRIVATE_KEY` on the relay host. The deployment machine needs only its public address and the separate `DEPLOYER_PRIVATE_KEY`. Only the `VITE_` settings go into the browser.
 
@@ -146,13 +146,16 @@ The funding page switches to the selected chain. It calls `depositTo` for event 
 
 | Contract | Address |
 | --- | --- |
-| Lasna watcher | [`0x86080d9B0a8A0F8244bAA756001A531986683a40`](https://lasna.reactscan.net/address/0x86080d9B0a8A0F8244bAA756001A531986683a40) · [Deployment at block 9061849](https://lasna.reactscan.net/tx/0x4a61e80c77d2a5e8c66eb78765eafbe26e805f0630605ae2f3bcde7e75203f6a) |
-| Base Sepolia factory | [`0x30f8D0140C181cEb12Fd7f8325DD3c9e58520E3e`](https://sepolia.basescan.org/address/0x30f8D0140C181cEb12Fd7f8325DD3c9e58520E3e) · [Deployment at block 62609418](https://sepolia.basescan.org/tx/0x86b40961f27d725ae813d3ac2e0ccac48febdbf310e4abcfb3f56d253e7873dd) |
+| Lasna watcher | [`0xc1BD44Ab59f254fAC8DB1D0C2cDDf00D6Cf31742`](https://lasna.reactscan.net/address/0xc1BD44Ab59f254fAC8DB1D0C2cDDf00D6Cf31742) · [Deployment at block 9388397](https://lasna.reactscan.net/tx/0xf3933f2867cfe84b328d7586733bec3f479579bf9dc08087b7731db0819500be) |
+| Base Sepolia factory | [`0xFA186f628F1F7DCA230b80E99e6c86F095c3BBc9`](https://sepolia.basescan.org/address/0xFA186f628F1F7DCA230b80E99e6c86F095c3BBc9) · [Deployment at block 64369230](https://sepolia.basescan.org/tx/0x459f4dffbf271a92dec7b5d1bb3c647760e34d921f762378b959df8cf17213bf) |
+| Lasna relay wallet | [`0x691c56ad29A16dC85A43304Bfb0aB54785e73F81`](https://lasna.reactscan.net/address/0x691c56ad29A16dC85A43304Bfb0aB54785e73F81) · [Relay authorization](https://lasna.reactscan.net/tx/0x26b6ff8ff1f78fcf172339eb9ad3536cd9a3cef39f53d26b6248c54731032f5b) |
 | Published demo event | Pending publication |
 | Base Sepolia callback proxy | `0x476F44b11F5C942c58f4c8E3d0300E5710743585` |
 | Base Sepolia Circle test USDC | `0x036CbD53842c5426634e7929541eC2318f3dCF7e` |
 
-The Lasna watcher bound this Base factory and subscribed to its `EventCreated` event at block 9062029. [Binding receipt](https://lasna.reactscan.net/tx/0x18bcdb3ea92de520c9ddb5de8731d44d7712c66985f368e5107afb502e87dadb)
+The watcher bound the new factory at Lasna block 9388479. Its execution reserve received 0.3 lREACT and the relay wallet received 0.3 lREACT for forwarding transactions. [Factory binding](https://lasna.reactscan.net/tx/0xbe715623fb8b1a7a125c4824cacb3b38636ca842ea449dbda2192782f0bccf04) · [Watcher deposit](https://lasna.reactscan.net/tx/0xcd746c325f18ce2be479b556977229ce6217f22d8e7d2c38c767d3042d8a153e) · [Relay funding](https://lasna.reactscan.net/tx/0xb049647e81be5b2c57bbc843b1aa5aed5772be946dbf6aaad2cdb90e301c1afc)
+
+The previous platform remains in `VITE_LEGACY_PLATFORMS` for existing event links. [Original Base factory](https://sepolia.basescan.org/address/0x30f8D0140C181cEb12Fd7f8325DD3c9e58520E3e) · [Original watcher binding](https://lasna.reactscan.net/tx/0x18bcdb3ea92de520c9ddb5de8731d44d7712c66985f368e5107afb502e87dadb)
 
 [Reactive network addresses](https://dev.reactive.network/origins-and-destinations) · [Circle USDC addresses](https://developers.circle.com/stablecoins/usdc-contract-addresses#testnet)
 
