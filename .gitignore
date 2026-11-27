@@ -1,4 +1,5 @@
 .env
+.relay-state/
 .env.*
 !.env.example
 *.pem

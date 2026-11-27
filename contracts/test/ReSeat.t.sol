@@ -19,6 +19,7 @@ import {
 import {EventWaitlist} from "../src/EventWaitlist.sol";
 import {WaitlistReactive} from "../src/WaitlistReactive.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {TestWalletValidator} from "./mocks/TestWalletValidator.sol";
 import {MockReactiveSystem, MockCallbackProxy} from "./mocks/MockReactiveSystem.sol";
 
 contract ReSeatTest is Test {
@@ -230,7 +231,7 @@ contract ReSeatTest is Test {
         SponsoredJoin memory b = _sponsored(meiKey, 1);
         token.mint(lin, 2 * PRICE);
         token.mint(mei, PRICE);
-        vm.etch(mei, abi.encodePacked(hex"ef0100", sellerB));
+        vm.etch(mei, type(TestWalletValidator).runtimeCode);
         uint256 fee = RESERVE / 10;
         proxy.setDeliveryFee(fee);
         vm.chainId(LASNA);
@@ -763,6 +764,20 @@ contract ReSeatTest is Test {
 
     function testUnknownCollectionFailureResumesAtOriginalHead() public {
         _deferredRecovery(false);
+    }
+
+    function testOrderWithChangedValidatorIsSkippedOnlyWhenCircleRejectsItsSignature() public {
+        _join(linKey, 1, start, PRICE);
+        _join(meiKey, 1, start, PRICE);
+        vm.etch(lin, hex"00");
+        _refund(sellerA, 1);
+        _relayState();
+        _deliver(0);
+        assertEq(uint8(_status(1)), uint8(EventWaitlist.Status.PaymentFailed));
+        assertEq(token.balanceOf(lin), PRICE);
+        assertFalse(token.authorizationState(lin, bytes32(uint256(1))));
+        assertEq(workshop.ticketBalance(mei), 1);
+        assertEq(token.balanceOf(mei), 0);
     }
 
     function _revokeLin() private {

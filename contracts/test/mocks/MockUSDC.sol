@@ -94,10 +94,18 @@ contract MockUSDC is IUSDC {
                 && uint256(s) <= 0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0,
             "Invalid signature"
         );
-        require(
-            ecrecover(keccak256(abi.encodePacked(hex"1901", DOMAIN_SEPARATOR(), body)), v, r, s) == authorizer,
-            "Invalid signer"
-        );
+        bytes32 digest = keccak256(abi.encodePacked(hex"1901", DOMAIN_SEPARATOR(), body));
+        if (authorizer.code.length == 0) {
+            require(ecrecover(digest, v, r, s) == authorizer, "Invalid signer");
+        } else {
+            bytes4 magic = 0x1626ba7e;
+            (bool ok, bytes memory output) =
+                authorizer.staticcall(abi.encodeWithSelector(magic, digest, abi.encodePacked(r, s, v)));
+            require(
+                ok && output.length >= 32 && abi.decode(output, (bytes32)) == bytes32(magic),
+                "FiatTokenV2: invalid signature"
+            );
+        }
         authorizationState[authorizer][nonce] = true;
     }
 

@@ -14,6 +14,7 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
         "ReceiveWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"
     );
     bytes32 private constant CANCEL_TYPEHASH = keccak256("CancelWaitlist(uint256 orderId,uint256 validBefore)");
+    bytes32 private constant CIRCLE_INVALID_SIGNATURE = keccak256(abi.encodeWithSignature("Error(string)", "FiatTokenV2: invalid signature"));
     bytes32 private immutable cancelDomain;
 
     enum Status {
@@ -363,7 +364,12 @@ contract EventWaitlist is AbstractCallback, ISettlement, TicketBook {
             _issue(order.buyer, order.qty, id);
             _resolve(id, Status.Issued);
             return true;
-        } catch {
+        } catch (bytes memory reason) {
+            // Circle checked this authorization with its current validator. Other token failures remain retryable.
+            if (keccak256(reason) == CIRCLE_INVALID_SIGNATURE) {
+                _resolve(id, Status.PaymentFailed);
+                return true;
+            }
             deferredHead = id;
             emit PaymentDeferred(id);
             return false;

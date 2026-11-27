@@ -1,8 +1,9 @@
 import { BrowserProvider, Contract, Signature, TypedDataEncoder, getAddress, hexlify, isAddress, isError, randomBytes,
-  type ContractTransactionResponse, type Eip1193Provider, type JsonRpcSigner, type TransactionReceipt } from "ethers";
+  type TransactionResponse, type Eip1193Provider, type JsonRpcSigner, type TransactionReceipt } from "ethers";
 import { useEffect, useRef, useState } from "react";
 import { BASE, USDC, baseAbi, bindingStatus, contractAddress, factoryAbi, localText, networks, readBaseBinding, readLasna, tokenAbi, type Chain } from "./chain";
-import { awaitDelivery, forgetJoin, pendingJoin, readDelivery, requireSponsorship, saveJoin, submitSponsored } from "./sponsorship";
+import { awaitDelivery, forgetJoin, pendingJoin, readDelivery, requireSponsorship, saveJoin, sponsorshipMessage, submitSponsored } from "./sponsorship";
+import { checkCircleAuthorization, receiveTypes } from "../relay/circle.mjs";
 import type { Order, OrderConfirmation } from "./orders";
 
 interface Wallet extends Eip1193Provider {
@@ -153,7 +154,7 @@ async function walletSigner(wallet: Wallet, account: string, chain: Chain) {
 export const workshopWith = (source: string, signer: JsonRpcSigner) => new Contract(source, baseAbi, signer);
 export type Notify = (text: string, hash?: string, chain?: Chain) => void;
 
-export async function confirm(tx: ContractTransactionResponse, notify: Notify, chain: Chain = "base", onReceipt?: (receipt: TransactionReceipt) => void) {
+export async function confirm(tx: TransactionResponse, notify: Notify, chain: Chain = "base", onReceipt?: (receipt: TransactionReceipt) => void) {
   notify("Waiting for " + networks[chain].label + " confirmation…", tx.hash, chain);
   let receipt: TransactionReceipt | null;
   try {
@@ -208,27 +209,36 @@ export async function join(signer: JsonRpcSigner, source: string, qty: number, u
     }
     await requireSponsorship(source);
   }
-  const fields = { ReceiveWithAuthorization: [
-    { name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" },
-    { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" },
-  ] };
   notify(sponsored ? localText("Sign the ticket total in USDC. The event pays the entry fee.", "请签名确认整单 USDC 金额，入队手续费由活动支付。") :
     localText("Sign the USDC authorization. Your wallet will then pay Base gas.", "请签署 USDC 授权，下一步由你的钱包支付 Base 手续费。"));
-  const sig = Signature.from(await signer.signTypedData(domain, fields, { from: signer.address, to: source,
-    value: BigInt(qty) * price, validAfter: 0, validBefore, nonce }));
+  const signed = await signer.signTypedData(domain, receiveTypes, { from: signer.address, to: source,
+    value: BigInt(qty) * price, validAfter: 0, validBefore, nonce });
+  let sig: { v: number; r: string; s: string };
+  try {
+    const { v, r, s } = Signature.from(signed);
+    sig = { v, r, s };
+  }
+  catch (error) {
+    if (await signer.provider.getCode(signer.address) !== "0x") throw new Error(sponsorshipMessage("wallet-signature"));
+    throw error;
+  }
+  const order = { kind: "join" as const, buyer: signer.address, qty, deadline: validBefore, salt: draft.salt, v: sig.v, r: sig.r, s: sig.s };
   if (sponsored) {
-    saveJoin(source, signer.address, draft);
-    const hash = await submitSponsored(source, { kind: "join", buyer: signer.address, qty, deadline: validBefore, salt: draft.salt, v: sig.v, r: sig.r, s: sig.s });
+    // A tab can close after bytes leave the browser but before the HTTP response arrives.
+    saveJoin(source, signer.address, { ...draft, sentAt: Date.now() });
+    const hash = await submitSponsored(source, order, previous === draft ? previous : undefined);
     saveJoin(source, signer.address, { ...draft, sentAt: Date.now(), hash });
     return awaitDelivery(source, signer.address, { nonce }, hash, notify, confirmed);
   }
+  const problem = await checkCircleAuthorization(signer.provider, source, order, price, nonce, await signer.provider.getBlockNumber());
+  if (problem) throw new Error(sponsorshipMessage(problem));
   notify(localText("Confirm the wallet-paid entry on Base.", "请确认这笔由钱包支付手续费的 Base 入队交易。"));
   return confirm(await workshop.enqueue(qty, userDeadline, [nonce, sig.v, sig.r, sig.s]), notify, "base", onReceipt);
 }
 
 export async function cancelSponsored(signer: JsonRpcSigner, source: string, order: Order, notify: Notify,
   confirmed: (value: OrderConfirmation) => void) {
-  await requireSponsorship(source);
+  await requireSponsorship(source, "cancel");
   const block = await signer.provider.getBlock("latest");
   if (!block || order.deadline <= block.timestamp) throw new Error(localText("The order deadline has passed.", "这笔候补已过截止时间。"));
   const validBefore = Math.min(order.deadline, block.timestamp + 900);

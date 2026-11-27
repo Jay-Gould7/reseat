@@ -1,5 +1,5 @@
 import { zeroPadValue, type JsonRpcProvider, type LogDescription } from "ethers";
-import { contractAddress, localText as t, networks, reader, type Chain } from "./chain";
+import { eventPlatform, localText as t, networks, reader, type Chain } from "./chain";
 
 export interface Entry {
   chain: Chain;
@@ -10,8 +10,7 @@ export interface Entry {
   event: LogDescription;
 }
 
-async function firstBlock(rpc: JsonRpcProvider, chain: Chain, address: string, head: number) {
-  const configured = networks[chain].start;
+async function firstBlock(rpc: JsonRpcProvider, chain: Chain, address: string, head: number, configured?: string) {
   if (configured?.trim()) {
     const value = Number(configured);
     if (!Number.isSafeInteger(value) || value < 0 || value > head) throw new Error("Check the deployment block in .env.");
@@ -41,8 +40,9 @@ export function createLedger(chain: Chain, source: string) {
   let entries: Entry[] = [];
   let span = 5000;
   return async (onSync: () => void, stopped: () => boolean) => {
-    if (!networks[chain].address) return { entries, through: -1 };
-    const address = chain === "lasna" ? contractAddress(chain) : source;
+    const platform = await eventPlatform(source);
+    const address = chain === "lasna" ? platform.watcher : source;
+    if (!address) return { entries, through: -1 };
     const rpc = await reader(chain);
     const latest = await rpc.getBlockNumber();
     const target = Math.max(0, latest - (chain === "base" ? 2 : 1));
@@ -50,7 +50,7 @@ export function createLedger(chain: Chain, source: string) {
       checkpoint = undefined;
       entries = [];
     }
-    start ??= await firstBlock(rpc, chain, address, latest);
+    start ??= await firstBlock(rpc, chain, address, latest, chain === "base" ? platform.baseStart : platform.lasnaStart);
     let from = checkpoint ? checkpoint.number + 1 : start;
     if (from <= target && !stopped()) onSync();
     while (from <= target && !stopped()) {

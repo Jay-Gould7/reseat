@@ -1,7 +1,8 @@
 import { Contract, Interface, JsonRpcProvider, ZeroAddress, ZeroHash, formatUnits, getAddress, isAddress, isError, type Provider } from "ethers";
 import sponsorshipAbi from "../relay/abi.json";
+import { circleAddress } from "../relay/circle.mjs";
 
-export const USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
+export const USDC = circleAddress;
 export const BASE = 84532;
 export const LASNA = 5318007;
 const detailsTuple = "(string name,string location,string description,string cover)";
@@ -86,6 +87,36 @@ export function contractAddress(chain: Chain) {
   return getAddress(value);
 }
 
+type Platform = { factory: string; watcher: string; baseStart?: string; lasnaStart?: string };
+function configuredPlatforms(): Platform[] {
+  const current = networks.base.address ? [{ factory: contractAddress("base"), watcher: networks.lasna.address ? contractAddress("lasna") : "",
+    baseStart: networks.base.start, lasnaStart: networks.lasna.start }] : [];
+  const rows = JSON.parse(import.meta.env.VITE_LEGACY_PLATFORMS || "[]") as Platform[];
+  return [...current, ...rows.map(row => ({ ...row, factory: getAddress(row.factory), watcher: getAddress(row.watcher),
+    baseStart: row.baseStart == null ? undefined : String(row.baseStart), lasnaStart: row.lasnaStart == null ? undefined : String(row.lasnaStart) }))];
+}
+const platformsByEvent = new Map<string, Platform & { sender: string; current: boolean }>();
+export async function eventPlatform(source: string, rpc?: Provider, blockTag: number | "latest" = "latest") {
+  source = getAddress(source);
+  const cached = platformsByEvent.get(source);
+  if (cached) return cached;
+  const base = rpc ?? await reader("base"), at = { blockTag };
+  const event = new Contract(source, baseAbi, base);
+  const origin = await event.factory(at).catch((err: unknown) => {
+    if (isError(err, "CALL_EXCEPTION") || isError(err, "BAD_DATA")) throw new Error("Choose an event published by this factory or a configured legacy factory.");
+    throw err;
+  });
+  const platform = configuredPlatforms().find(p => p.factory === origin);
+  if (!platform) throw new Error("Choose an event published by this factory or a configured legacy factory.");
+  const factory = new Contract(origin, factoryAbi, base);
+  const [listed, watcher, sender] = await Promise.all([factory.isEvent(source, at), factory.watcher(at), event._CALLBACK_SENDER(at)]);
+  const current = origin.toLowerCase() === networks.base.address.toLowerCase();
+  if (!listed || sender !== watcher || (!current && watcher !== platform.watcher)) throw new Error("The event and its trusted platform do not match.");
+  const verified = { ...platform, sender: String(sender), current };
+  platformsByEvent.set(source, verified);
+  return verified;
+}
+
 export const txUrl = (chain: Chain, hash: string) => networks[chain].explorer + "/tx/" + hash;
 export const shortAddress = (value: string) => value.slice(0, 6) + "…" + value.slice(-4);
 export const localText = (english: string, chinese: string) =>
@@ -101,17 +132,13 @@ export function coverUrl(raw: string) {
 }
 
 export async function readBaseBinding(rpc: Provider, source: string, blockTag: number | "latest" = "latest") {
-  const platform = contractAddress("base");
-  const factory = new Contract(platform, factoryAbi, rpc);
+  const platform = await eventPlatform(source, rpc, blockTag);
+  const factory = new Contract(platform.factory, factoryAbi, rpc);
   const event = new Contract(source, baseAbi, rpc);
   const at = { blockTag };
-  if (!await factory.isEvent(source, at)) throw new Error("This event is outside the configured ReSeat factory.");
-  const [origin, sender, confirmed, platformWatcher, retryAt] = await Promise.all([
-    event.factory(at), event._CALLBACK_SENDER(at), event.automationReady(at), factory.watcher(at), factory.activationRetryAt(source, at),
-  ]);
-  if (getAddress(origin) !== platform) throw new Error("The event factory does not match this platform.");
-  return { source: getAddress(source), factory: platform, sender: String(sender), confirmed: Boolean(confirmed),
-    platformWatcher: String(platformWatcher), retryAt: Number(retryAt) };
+  const [confirmed, retryAt] = await Promise.all([event.automationReady(at), factory.activationRetryAt(source, at)]);
+  return { source: getAddress(source), factory: platform.factory, sender: platform.sender, confirmed: Boolean(confirmed),
+    platformWatcher: platform.sender, current: platform.current, retryAt: Number(retryAt) };
 }
 
 export const firstTicketPage = { grant: 0n, offset: 0 };
@@ -155,15 +182,15 @@ export async function readBase(source: string, account: string, cursor: TicketCu
     account ? event.ticketsPage(account, cursor.grant, cursor.offset, at) : null,
     account ? event.ticketBalance(account, at) : 0n, event.organizer(at), event.retainedProceeds(at), event.canRetrySettlement(at),
   ]);
-  return { block, event: { ...preview, binding, publicSeats: Number(publicSeats),
+  return { block, event: { ...preview, sponsored: preview.sponsored && binding.current, binding, publicSeats: Number(publicSeats),
     heldFor: String(state.head), held: Number(state.heldSpots), blocked: Boolean(state.paymentBlocked), tickets: Array.from((page?.ids ?? []) as bigint[]),
     ticketCount: BigInt(count), nextPage: page?.more ? { grant: BigInt(page.nextGrant), offset: Number(page.nextOffset) } : null,
     account, canRetry: Boolean(canRetry), organizer: String(organizer), proceeds: BigInt(proceeds) } };
 }
 
 export async function readLasna(source: string) {
-  if (!networks.lasna.address) return null;
-  const address = contractAddress("lasna");
+  const address = (await eventPlatform(source)).watcher;
+  if (!address) return null;
   const rpc = await reader("lasna");
   const block = await rpc.getBlock("latest");
   if (!block) throw new Error("Lasna block unavailable.");

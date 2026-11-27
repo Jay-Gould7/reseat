@@ -51,9 +51,9 @@ async function deploy(art, wallet, ...args) {
   return contract;
 }
 
-export async function platform(t) {
-  const base = await node(t, 84532);
-  const lasna = await node(t, 5318007);
+export async function platform(t, shared) {
+  const base = shared?.base ?? await node(t, 84532);
+  const lasna = shared?.lasna ?? await node(t, 5318007);
   const operator = await actor(base.rpc), operatorL = await actor(lasna.rpc);
   const tokenArt = await artifact("MockUSDC"), systemArt = await artifact("MockReactiveSystem");
   await base.rpc.send("anvil_setCode", [tokenAddress, tokenArt.deployedBytecode.object]);
@@ -69,6 +69,10 @@ export async function platform(t) {
   await lasna.rpc.send("anvil_setBalance", [watcher.target, toBeHex(parseEther("1"))]);
   const eventArt = await artifact("EventWaitlist");
   const event = address => new Contract(address, eventArt.abi, operator);
+  async function delegateToTestValidator(address) {
+    const validator = await deploy(await artifact("TestWalletValidator"), operator);
+    await base.rpc.send("anvil_setCode", [address, "0xef0100" + validator.target.slice(2)]);
+  }
 
   async function relay(log) {
     return mined(system.relay(watcher.target, { chainId: 84532, contractAddress: log.address, topic0: log.topics[0],
@@ -91,7 +95,12 @@ export async function platform(t) {
       while (sponsoredCursor < count) {
         const index = sponsoredCursor++;
         const [request] = await system.requestAt(index);
-        if (request.recipient === contract.target && request.payload.startsWith(selector)) return deliver(index, contract.target);
+        if (request.recipient === contract.target && request.payload.startsWith(selector)) {
+          const [origin] = await system.queryFilter(system.filters.TransportRequested(index));
+          const receipt = await deliver(index, contract.target);
+          await mined(system.recordDelivery(origin.transactionHash, watcher.target, receipt.hash));
+          return receipt;
+        }
       }
       await delay(100);
     }
@@ -102,7 +111,7 @@ export async function platform(t) {
     for (const log of logs) await relay(log);
     if (logs.length) cursors.set(contract.target, logs.at(-1).blockNumber + 1);
   }
-  return { base, lasna, factory, watcher, token, system, proxy, event, relay, deliver, relayStates, relayer, deliverSponsored };
+  return { base, lasna, factory, watcher, token, system, proxy, event, relay, deliver, relayStates, relayer, deliverSponsored, delegateToTestValidator };
 }
 
 export async function walletPage(browser, platform, wallet, origin, { secondAccount, otherWallet, rejectWalletTransactions = false } = {}) {

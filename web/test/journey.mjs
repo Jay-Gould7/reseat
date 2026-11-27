@@ -1,24 +1,66 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtemp, readdir, unlink, rmdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join as joinPath } from "node:path";
+import { createServer as httpServer, request as httpRequest } from "node:http";
 import { Signature, hexlify, parseEther, randomBytes, toBeHex } from "ethers";
 import { chromium } from "playwright-core";
 import { createServer } from "vite";
 import { actor, freePort, mined, platform, walletPage, webRoot } from "./local.mjs";
 
-async function openPlatform(t) {
+async function openPlatform(t, { legacy = false, env = {} } = {}) {
   const p = await platform(t);
+  const old = legacy ? await platform(t, p) : undefined;
+  const stateDir = await mkdtemp(joinPath(tmpdir(), "reseat-relay-"));
+  t.after(async () => { for (const file of await readdir(stateDir)) await unlink(joinPath(stateDir, file)); await rmdir(stateDir); });
   const port = await freePort();
   const origin = "http://127.0.0.1:" + port;
   Object.assign(process.env, { VITE_BASE_RPC_URL: p.base.url, VITE_LASNA_RPC_URL: p.lasna.url,
     BASE_SEPOLIA_RPC_URL: p.base.url, LASNA_RPC_URL: p.lasna.url, WAITLIST_RELAY_PRIVATE_KEY: p.relayer.privateKey,
     VITE_FACTORY_ADDRESS: p.factory.target, VITE_REACTIVE_ADDRESS: p.watcher.target,
-    VITE_BASE_START_BLOCK: "0", VITE_LASNA_START_BLOCK: "0" });
+    VITE_BASE_START_BLOCK: "0", VITE_LASNA_START_BLOCK: "0", WAITLIST_RELAY_STATE_DIR: stateDir,
+    VITE_LEGACY_PLATFORMS: JSON.stringify(old ? [{ factory: old.factory.target, watcher: old.watcher.target, baseStart: 0, lasnaStart: 0 }] : []),
+    WAITLIST_BASE_CALLBACK_WEI: "10000000000000", WAITLIST_LASNA_TX_WEI: "5000000000000000", WAITLIST_LASNA_EXECUTION_WEI: "10000000000000000",
+    WAITLIST_TRUSTED_PROXIES: "", ...env });
   const server = await createServer({ root: webRoot, cacheDir: "node_modules/.vite-reseat-tests", logLevel: "error",
     server: { host: "127.0.0.1", port, strictPort: true } });
   await server.listen(); t.after(() => server.close());
   const browser = await chromium.launch({ headless: true, executablePath: process.env.RESEAT_BROWSER });
   t.after(() => browser.close());
-  return { p, server, browser, origin };
+  return { p, old, server, browser, origin, stateDir };
+}
+
+async function sellOut(p, name, { seats = 2, price = 1_000_000n, startsIn = 86400 } = {}) {
+  const host = await actor(p.base.rpc), holder = await actor(p.base.rpc);
+  const start = (await p.base.rpc.getBlock("latest")).timestamp + startsIn;
+  const index = await p.factory.eventCount();
+  const created = await mined(p.factory.connect(host).createEvent([name, "", "", ""], start, seats, price, { value: await p.factory.callbackDeposit() }));
+  const event = p.event(await p.factory.events(index));
+  const binding = await p.system.requestCount();
+  await p.relay((await p.factory.queryFilter(p.factory.filters.EventCreated(), created.blockNumber, created.blockNumber))[0]);
+  await p.deliver(binding, event.target);
+  await p.relayStates(event);
+  await mined(p.token.mint(holder.address, price * BigInt(seats)));
+  await mined(p.token.connect(holder).approve(event.target, price * BigInt(seats)));
+  await mined(event.connect(holder).buy(seats));
+  return { event, host, holder, price, start };
+}
+
+async function signedJoin(p, event, buyer, deadline) {
+  const salt = hexlify(randomBytes(32)), nonce = await event.sponsoredNonce(buyer.address, 1, deadline, salt);
+  const domain = { name: await p.token.name(), version: await p.token.version(), verifyingContract: p.token.target, chainId: 84532 };
+  const types = { ReceiveWithAuthorization: [
+    { name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" },
+    { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" },
+  ] };
+  const sig = Signature.from(await buyer.signTypedData(domain, types, { from: buyer.address, to: event.target,
+    value: await event.ticketPrice(), validAfter: 0, validBefore: deadline, nonce }));
+  return { kind: "join", buyer: buyer.address, qty: 1, deadline, salt, v: sig.v, r: sig.r, s: sig.s };
+}
+
+function postIntent(endpoint, body) {
+  return fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
 test("publish and share two independent events, activate, reserve and recover payment", { timeout: 240_000 }, async t => {
@@ -285,6 +327,12 @@ test("top up the Lasna watcher and an event's Base proxy credit from the funding
   assert.equal(await p.base.rpc.getBalance(event), 0n);
   assert.equal(await p.proxy.reserves(p.factory.target), 0n);
   assert.equal(await p.system.reserves(p.watcher.target), parseEther("0.1"));
+  const relay = page.getByRole("region", { name: "Lasna relay wallet" });
+  const before = await p.lasna.rpc.getBalance(p.relayer.address);
+  await relay.getByLabel("Top-up amount (lREACT)").fill("0.025");
+  await relay.getByRole("button", { name: "Add 0.025 lREACT" }).click();
+  await relay.getByText("10.025 lREACT", { exact: true }).waitFor();
+  assert.equal(await p.lasna.rpc.getBalance(p.relayer.address), before + parseEther("0.025"));
 
   const budgets = await server.ssrLoadModule("/src/feeBudget.ts");
   await assert.rejects(budgets.readFunding("event", host.address), /Choose an event published by this factory/);
@@ -350,7 +398,7 @@ test("two zero-ETH accounts join and cancel with event credit across wallet exte
   const url = origin + "/?event=" + event.target;
   await p.base.rpc.send("anvil_setBalance", [buyer.address, "0x0"]);
   await p.base.rpc.send("anvil_setBalance", [other.address, "0x0"]);
-  await p.base.rpc.send("anvil_setCode", [other.address, "0xef0100d6cedde84be40893d153be9d467cd6ad37875b28"]);
+  await p.delegateToTestValidator(other.address);
   const fee = parseEther("0.000005");
   await mined(p.proxy.setDeliveryFee(fee));
   const credit = await p.proxy.reserves(event.target);
@@ -377,7 +425,10 @@ test("two zero-ETH accounts join and cancel with event credit across wallet exte
   async function join(qty) {
     await page.getByText("Automatic waitlist ready", { exact: true }).waitFor();
     await page.getByLabel("Ticket quantity", { exact: true }).fill(String(qty));
+    const decision = page.waitForResponse(response => response.request().method() === "POST" && response.url().includes("/api/waitlist/"));
     await page.getByRole("button", { name: "Sign & join waitlist" }).click();
+    const response = await decision;
+    assert.equal(response.status(), 202, await response.text());
     await page.getByText("The event is paying the fee. Waiting for Base confirmation…", { exact: true }).waitFor();
     assert.equal(await page.getByText("Your order is confirmed on the waitlist.", { exact: true }).count(), 0);
     await p.deliverSponsored(event, "enqueueSponsored");
@@ -447,15 +498,15 @@ test("funding gates signatures and a pending entry survives reload and duplicate
   const host = await actor(p.base.rpc), buyer = await actor(p.base.rpc);
   const start = (await p.base.rpc.getBlock("latest")).timestamp + 86400;
   const price = 2_000_000n, credit = await p.factory.callbackDeposit();
-  await mined(p.factory.connect(host).createEvent(["Sponsored Lab", "", "", ""], start, 1, price, { value: credit }));
+  await mined(p.factory.connect(host).createEvent(["Sponsored Lab", "", "", ""], start, 2, price, { value: credit }));
   const event = p.event(await p.factory.events(0));
   await mined(p.proxy.setDeliveryFee(credit));
   await p.relay((await p.factory.queryFilter(p.factory.filters.EventCreated()))[0]);
   await p.deliver(0, event.target);
   await p.relayStates(event);
-  await mined(p.token.mint(host.address, price));
-  await mined(p.token.connect(host).approve(event.target, price));
-  await mined(event.connect(host).buy(1));
+  await mined(p.token.mint(host.address, 2n * price));
+  await mined(p.token.connect(host).approve(event.target, 2n * price));
+  await mined(event.connect(host).buy(2));
   await mined(p.token.mint(buyer.address, price));
   await p.base.rpc.send("anvil_setBalance", [buyer.address, "0x0"]);
   const { page, signatures, transactions } = await walletPage(browser, p, buyer, origin + "/?event=" + event.target, { rejectWalletTransactions: true });
@@ -472,25 +523,53 @@ test("funding gates signatures and a pending entry survives reload and duplicate
 
   const endpoint = origin + "/api/waitlist/" + event.target;
   const post = body => fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const firstResponse = page.waitForResponse(r => r.url() === endpoint && r.request().method() === "POST");
+  const quantity = page.getByLabel("Ticket quantity", { exact: true });
+  await quantity.fill("2");
+  await page.route(endpoint, route => route.fulfill({ status: 429, json: { status: "busy", delivery: "not-sent" } }), { times: 1 });
   await page.getByRole("button", { name: "Sign & join waitlist" }).click();
-  const response = await firstResponse;
-  assert.equal(response.status(), 202);
-  const signed = response.request().postDataJSON();
-  const original = await response.json(), before = await p.system.requestCount();
+  await page.getByText("The relay is busy. Try again shortly.", { exact: true }).waitFor();
+  assert.equal(await quantity.isEditable(), true);
+  await quantity.fill("1");
+  await page.getByLabel("Wait until").selectOption("3600");
+  let signed, original;
+  // The server accepted the request, but its HTTP response never reached the browser.
+  await page.route(endpoint, async route => {
+    signed = route.request().postDataJSON();
+    const response = await route.fetch();
+    assert.equal(response.status(), 202);
+    original = await response.json();
+    await route.abort("connectionreset");
+  }, { times: 1 });
+  await page.getByRole("button", { name: "Sign & join waitlist" }).click();
+  await page.getByText(/Delivery could not be confirmed/).waitFor();
+  assert.equal(signed.qty, 1);
+  assert.ok(signed.deadline < start);
+  const before = await p.system.requestCount();
   assert.deepEqual(await (await post(signed)).json(), original);
   assert.equal((await post({ ...signed, deadline: signed.deadline - 10 })).status, 422);
   assert.equal(await p.system.requestCount(), before);
   assert.equal(await event.activeOrders(), 0n);
-  await page.getByText("The event is paying the fee. Waiting for Base confirmation…", { exact: true }).waitFor();
   await page.reload();
+  // Age only the browser's retry clock. A later definite refusal cannot cancel the original uncertain send.
+  const draftKey = "reseat:pending:84532:" + event.target.toLowerCase() + ":" + buyer.address.toLowerCase();
+  await page.evaluate(key => {
+    const old = JSON.parse(localStorage.getItem(key));
+    old.sentAt -= 300_001;
+    localStorage.setItem(key, JSON.stringify(old));
+  }, draftKey);
+  await page.route(endpoint, route => route.fulfill({ status: 429, json: { status: "busy", delivery: "not-sent" } }), { times: 1 });
   await page.getByRole("button", { name: "Check pending entry" }).click();
-  await page.getByText("The event is paying the fee. Waiting for Base confirmation…", { exact: true }).waitFor();
-  assert.equal(signatures.length, 1);
+  await page.getByText("The relay is busy. Try again shortly.", { exact: true }).waitFor();
+  assert.equal(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).salt, draftKey), signed.salt);
+  assert.equal(await quantity.isEditable(), false);
+  assert.equal(signatures.length, 3);
+  await page.reload();
   await p.deliverSponsored(event, "enqueueSponsored");
-  await page.getByText("Your order is confirmed on the waitlist.", { exact: true }).waitFor();
+  await page.getByRole("region", { name: "My waitlist orders" }).getByText("Order #1", { exact: true }).waitFor();
+  await page.waitForFunction(key => localStorage.getItem(key) === null, draftKey);
   assert.equal((await (await post(signed)).json()).status, "confirmed");
   assert.equal(await event.nextId(), 2n);
+  assert.equal(await page.evaluate(() => Object.keys(localStorage).filter(k => k.startsWith("reseat:pending:")).length), 0);
   assert.equal(await p.system.requestCount(), before);
   assert.equal(await p.proxy.reserves(event.target), 2n * credit);
   assert.equal(await p.token.balanceOf(buyer.address), price);
@@ -505,4 +584,187 @@ test("funding gates signatures and a pending entry survives reload and duplicate
   });
   await legacy.goto(origin + "/?event=" + event.target);
   await legacy.getByText("这场旧版活动加入和取消候补都需要钱包发交易并支付 Base 手续费。", { exact: true }).waitFor();
+});
+
+test("Circle rejects an incompatible wallet before sponsorship; a zero-ETH buyer closes the page and receives exactly two seats for 2 USDC", { timeout: 120_000 }, async t => {
+  const { p, browser, origin } = await openPlatform(t);
+  const { event, holder, price } = await sellOut(p, "One dollar workshop");
+  const buyer = await actor(p.base.rpc);
+  await p.base.rpc.send("anvil_setBalance", [buyer.address, "0x0"]);
+  await mined(p.token.mint(buyer.address, 2n * price));
+  // An ERC-1271 account that returns no magic value. The fork suite exercises real delegation implementations.
+  await p.base.rpc.send("anvil_setCode", [buyer.address, "0x00"]);
+  const { page, signatures, transactions } = await walletPage(browser, p, buyer, origin + "/?event=" + event.target, { rejectWalletTransactions: true });
+  await page.getByLabel("Ticket quantity", { exact: true }).fill("2");
+  const before = await p.system.requestCount(), lasnaNonce = await p.lasna.rpc.getTransactionCount(p.relayer.address);
+  await page.getByRole("button", { name: "Sign & join waitlist" }).click();
+  await page.getByText(/Circle USDC cannot collect with this smart account signature/).waitFor();
+  assert.equal(await p.system.requestCount(), before);
+  assert.equal(await p.lasna.rpc.getTransactionCount(p.relayer.address), lasnaNonce);
+  assert.equal(await event.activeOrders(), 0n);
+  await p.base.rpc.send("anvil_setCode", [buyer.address, "0x"]);
+  await page.getByRole("button", { name: "Sign & join waitlist" }).click();
+  await p.deliverSponsored(event, "enqueueSponsored");
+  await page.getByText("Your order is confirmed on the waitlist.", { exact: true }).waitFor();
+  const nonce = signatures.at(-1).nonce;
+  assert.equal(transactions.length, 0);
+  assert.equal(await p.token.balanceOf(buyer.address), 2_000_000n);
+  assert.equal(await p.base.rpc.getBalance(buyer.address), 0n);
+  await page.context().close();
+
+  await mined(event.connect(holder).refund(1));
+  await p.relayStates(event);
+  assert.equal((await event.settlementState()).heldSpots, 1n);
+  assert.equal(await p.token.balanceOf(buyer.address), 2_000_000n);
+  assert.equal(await p.token.authorizationState(buyer.address, nonce), false);
+  assert.equal(await event.ticketBalance(buyer.address), 0n);
+  const settlement = await p.system.requestCount();
+  await mined(event.connect(holder).refund(2));
+  await p.relayStates(event);
+  await p.deliver(settlement, event.target);
+  await p.deliver(settlement, event.target);
+  assert.equal(await p.token.balanceOf(buyer.address), 0n);
+  assert.equal(await event.ticketBalance(buyer.address), 2n);
+  assert.equal(await event.retainedProceeds(), 2_000_000n);
+  assert.equal((await p.token.queryFilter(p.token.filters.AuthorizationUsed(buyer.address, nonce))).length, 1);
+  assert.equal(await p.base.rpc.getBalance(buyer.address), 0n);
+});
+
+test("admission reserves in-flight and queued orders across restart and reports the three funding destinations", { timeout: 120_000 }, async t => {
+  const { p, origin, server } = await openPlatform(t, { env: { WAITLIST_BASE_CALLBACK_WEI: "50000000000000" } });
+  const { event, start } = await sellOut(p, "Budget workshop");
+  const unit = (await p.factory.callbackDeposit()) / 2n;
+  await mined(p.proxy.setDeliveryFee(unit));
+  const endpoint = origin + "/api/waitlist/" + event.target;
+  const buyers = [await actor(p.base.rpc), await actor(p.base.rpc)];
+  const intents = await Promise.all(buyers.map(b => signedJoin(p, event, b, start)));
+  const status = async () => (await (await fetch(endpoint)).json()).status;
+  const before = await p.system.requestCount();
+  assert.equal(await status(), "ready");
+  const results = await Promise.all(intents.map(body => postIntent(endpoint, body)));
+  assert.deepEqual(results.map(r => r.status).sort(), [202, 503]);
+  const refused = results.findIndex(r => r.status === 503), next = intents[refused];
+  assert.deepEqual(await results[refused].json(), { status: "event-funds", delivery: "not-sent" });
+  assert.equal(await p.system.requestCount(), before + 1n);
+  assert.equal(await status(), "event-funds");
+  await server.restart();
+  assert.equal(await status(), "event-funds");
+  await p.deliverSponsored(event, "enqueueSponsored");
+  assert.equal(await event.activeOrders(), 1n);
+  assert.equal(await p.proxy.reserves(event.target), unit);
+  assert.equal(await status(), "event-funds");
+  assert.equal((await (await fetch(endpoint + "?action=cancel")).json()).status, "ready");
+  await mined(p.proxy.depositTo(event.target, { value: unit * 2n }));
+  assert.equal(await status(), "ready");
+  async function checkRefusal(reason) {
+    assert.equal(await status(), reason);
+    assert.deepEqual(await (await postIntent(endpoint, next)).json(), { status: reason, delivery: "not-sent" });
+    assert.equal(await p.system.requestCount(), before + 1n);
+  }
+  await mined(p.proxy.setDebt(event.target, 1));
+  await checkRefusal("event-funds");
+  await mined(p.proxy.depositTo(event.target, { value: 1 }));
+  await p.lasna.rpc.send("anvil_setBalance", [p.relayer.address, "0x1"]);
+  await checkRefusal("relay-funds");
+  await mined(p.watcher.runner.sendTransaction({ to: p.relayer.address, value: parseEther("0.2") }));
+  await p.lasna.rpc.send("anvil_setBalance", [p.watcher.target, "0x1"]);
+  await checkRefusal("watcher-funds");
+  await mined(p.system.depositTo(p.watcher.target, { value: parseEther("0.1") }));
+  await mined(p.system.setDebt(p.watcher.target, 1));
+  await checkRefusal("watcher-funds");
+  await mined(p.system.depositTo(p.watcher.target, { value: 1 }));
+  assert.equal(await status(), "ready");
+  assert.equal((await postIntent(endpoint, next)).status, 202);
+  await p.deliverSponsored(event, "enqueueSponsored");
+  assert.equal(await event.activeOrders(), 2n);
+});
+
+test("one trusted reverse proxy gives visitors separate quotas and retains the shared write limit", { timeout: 90_000 }, async t => {
+  const { p, origin } = await openPlatform(t, { env: { WAITLIST_TRUSTED_PROXIES: "127.0.0.1" } });
+  const { event, start } = await sellOut(p, "Proxy workshop");
+  const endpoint = origin + "/api/waitlist/" + event.target;
+  const proxy = httpServer((req, res) => {
+    const upstream = httpRequest(endpoint, { method: "POST", headers: { ...req.headers, "x-real-ip": req.socket.remoteAddress } }, reply => {
+      res.writeHead(reply.statusCode, reply.headers); reply.pipe(res);
+    });
+    req.pipe(upstream);
+  });
+  await new Promise(resolve => proxy.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => proxy.close(resolve)));
+  const throughProxy = (body, localAddress) => new Promise((resolve, reject) => {
+    const req = httpRequest({ hostname: "127.0.0.1", port: proxy.address().port, localAddress, method: "POST", agent: false,
+      headers: { "Content-Type": "application/json", "X-Real-IP": "203.0.113.99" } }, res => {
+      res.resume(); res.on("end", () => resolve(res.statusCode));
+    });
+    req.on("error", reject); req.end(JSON.stringify(body));
+  });
+  const ipA = "127.0.0.2", ipB = "127.0.0.3";
+  for (let i = 0; i < 19; i++) assert.equal(await throughProxy({}, ipA), 400);
+  const a = await actor(p.base.rpc), b = await actor(p.base.rpc);
+  assert.equal(await throughProxy(await signedJoin(p, event, a, start), ipA), 202);
+  assert.equal(await throughProxy({}, ipA), 429);
+  assert.equal(await throughProxy(await signedJoin(p, event, b, start), ipB), 202);
+  await p.deliverSponsored(event, "enqueueSponsored");
+  await p.deliverSponsored(event, "enqueueSponsored");
+  assert.equal(await event.activeOrders(), 2n);
+  for (let i = 21; i < 120; i++) assert.equal(await throughProxy({}, "127.0.1." + i), 400);
+  assert.equal(await throughProxy({}, "127.0.2.1"), 429);
+});
+
+test("separate events cannot spend the same pending relay gas or the shared watcher's last settlement credit", { timeout: 90_000 }, async t => {
+  const { p, origin } = await openPlatform(t, { env: { WAITLIST_LASNA_TX_WEI: "50000000000000000" } });
+  const a = await sellOut(p, "First budget"), b = await sellOut(p, "Second budget");
+  const first = await signedJoin(p, a.event, await actor(p.base.rpc), a.start);
+  const second = await signedJoin(p, b.event, await actor(p.base.rpc), b.start);
+  const endpoint = target => origin + "/api/waitlist/" + target.event.target;
+  const quote = async () => (await (await fetch(endpoint(b))).json()).status;
+  await p.lasna.rpc.send("anvil_setBalance", [p.relayer.address, toBeHex(parseEther("0.075"))]);
+  await p.lasna.rpc.send("anvil_setBalance", [p.watcher.target, toBeHex(parseEther("0.02"))]);
+  await p.lasna.rpc.send("evm_setAutomine", [false]);
+  try {
+    const accepted = await postIntent(endpoint(a), first);
+    assert.equal(accepted.status, 202);
+    assert.equal(await p.lasna.rpc.getTransactionReceipt((await accepted.json()).hash), null);
+    assert.equal(await quote(), "relay-funds");
+    assert.equal((await (await postIntent(endpoint(b), second)).json()).status, "relay-funds");
+    await p.lasna.rpc.send("evm_mine", []);
+  } finally { await p.lasna.rpc.send("evm_setAutomine", [true]); }
+  assert.equal(await quote(), "watcher-funds");
+  await p.deliverSponsored(a.event, "enqueueSponsored");
+  assert.equal(await a.event.activeOrders(), 1n);
+  assert.equal(await quote(), "watcher-funds");
+  await mined(p.system.depositTo(p.watcher.target, { value: parseEther("0.01") }));
+  assert.equal(await quote(), "ready");
+  assert.equal((await postIntent(endpoint(b), second)).status, 202);
+});
+
+test("an original share link still supports refund and host withdrawal after the active factory changes", { timeout: 120_000 }, async t => {
+  const { p, old, origin, browser, server } = await openPlatform(t, { legacy: true });
+  const archived = await sellOut(old, "Original venue");
+  const current = await sellOut(p, "New factory venue", { price: 3_000_000n, startsIn: 172800 });
+  const oldLink = origin + "/?event=" + archived.event.target;
+  const guest = await browser.newPage({ locale: "en-US" });
+  await guest.goto(oldLink);
+  await guest.getByRole("heading", { name: "Original venue", exact: true }).waitFor();
+  await guest.getByText("This older event requires a wallet transaction and Base gas to join or cancel.").waitFor();
+  const chain = await server.ssrLoadModule("/src/chain.ts");
+  assert.equal((await chain.readLasna(archived.event.target)).address, old.watcher.target);
+  assert.equal((await chain.readLasna(current.event.target)).address, p.watcher.target);
+  assert.equal((await (await fetch(origin + "/api/waitlist/" + archived.event.target)).json()).status, "binding");
+  assert.equal(await p.factory.isEvent(archived.event.target), false);
+  await guest.goto(origin + "/?events");
+  await guest.getByRole("heading", { name: "New factory venue" }).waitFor();
+  assert.equal(await guest.getByRole("heading", { name: "Original venue" }).count(), 0);
+  const { page: holder } = await walletPage(browser, old, archived.holder, oldLink);
+  await holder.getByRole("button", { name: "Refund 1 USDC", exact: true }).first().click();
+  await holder.getByText("Ticket refunded to your wallet.", { exact: true }).waitFor();
+  assert.equal(await old.token.balanceOf(archived.holder.address), 1_000_000n);
+  await old.base.rpc.send("evm_setNextBlockTimestamp", [archived.start]);
+  await old.base.rpc.send("evm_mine", []);
+  const { page: host } = await walletPage(browser, old, archived.host, oldLink);
+  await host.getByRole("button", { name: "Withdraw 1 USDC", exact: true }).click();
+  await host.getByText("Event proceeds withdrawn.", { exact: true }).waitFor();
+  assert.equal(await old.token.balanceOf(archived.host.address), 1_000_000n);
+  assert.equal(await archived.event.retainedProceeds(), 0n);
+  assert.equal(await current.event.retainedProceeds(), 6_000_000n);
 });

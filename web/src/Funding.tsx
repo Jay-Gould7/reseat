@@ -13,21 +13,22 @@ function FundCard({ fund, source, account, busy, connect, run, notify, getSigner
   const { data, error } = usePolling(load);
   const [amount, setAmount] = useState("");
   const value = nativeAmount(amount);
-  const title = fund === "event" ? t("Event callbacks", "本场活动回调") : t("Platform watcher", "平台自动候补");
+  const title = fund === "event" ? t("Event callbacks", "本场活动回调") : fund === "relay" ? t("Lasna relay wallet", "Lasna 转发钱包") : t("Platform watcher", "平台自动候补");
   const success = t("Funding confirmed.", "充值已确认。");
   return <section className="panel funding-card" aria-label={title}>
     <div className="section-heading"><h2>{title}</h2><span className="pill pill-blue">{net.label}</span></div>
     <p>{fund === "event" ? t("Pays for automatic seating and, on sponsorship-enabled events, for guests to join or cancel.", "用于自动补票；支持代付的活动也从这里支付来宾加入和取消候补的手续费。") :
+      fund === "relay" ? t("Pays the Lasna gas to submit signed waitlist requests.", "支付向 Lasna 提交候补签名请求的手续费。") :
       t("Pays for Lasna execution across all events.", "支付所有活动在 Lasna 上的执行费。")}</p>
     {error && <p role="status" className="problem">{error}</p>}
     {!data ? !error && <p role="status">{t("Reading chain balance…", "正在读取链上余额…")}</p> : <>
       <a className="text-action" href={net.explorer + "/address/" + data.address} target="_blank" rel="noreferrer" title={data.address}>
         {shortAddress(data.address)} <ExternalLink size={13} /></a>
       <dl className="funding-balances">
-        <div><dt>{t("Prepaid credit", "预存余额")}</dt><dd>{formatEther(data.credit)} {unit}</dd></div>
-        <div><dt>{t("Outstanding debt", "待付费用")}</dt><dd>{formatEther(data.debt)} {unit}</dd></div>
+        <div><dt>{fund === "relay" ? t("Wallet balance", "钱包余额") : t("Prepaid credit", "预存余额")}</dt><dd>{formatEther(data.credit)} {unit}</dd></div>
+        {fund !== "relay" && <div><dt>{t("Outstanding debt", "待付费用")}</dt><dd>{formatEther(data.debt)} {unit}</dd></div>}
       </dl>
-      <p>{t("Prepaid network credit is non-refundable.", "网络预存费用不可退回。")}</p>
+      {fund !== "relay" && <p>{t("Prepaid network credit is non-refundable.", "网络预存费用不可退回。")}</p>}
       <form className="publish-form" onSubmit={e => {
         e.preventDefault();
         if (!account) { connect(); return; }
@@ -70,6 +71,7 @@ export function Funding({ source, ...session }: Session & { source: string | nul
             onInput={e => e.currentTarget.setCustomValidity("")} /></label>
           <button className="secondary">{t("View event balance", "查看活动余额")}</button></form>
         <AppLink className="text-action" href="?events">{t("Browse events", "浏览活动")}</AppLink></section>}
-      <FundCard {...session} fund="watcher" source={null} />
+      <FundCard {...session} fund="watcher" source={valid ? source : null} />
+      <FundCard {...session} fund="relay" source={valid ? source : null} />
     </div></div>;
 }

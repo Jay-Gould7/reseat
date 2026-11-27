@@ -7,7 +7,7 @@ import { Funding } from "./Funding";
 import { MyOrders } from "./MyOrders";
 import { Publish } from "./Publish";
 import { Registration } from "./Registration";
-import { baseAbi, bindingStatus, eventUrl, factoryAbi, contractAddress, firstTicketPage, formatTime, localText, networks, reader, shortAddress, txUrl, type Chain } from "./chain";
+import { baseAbi, bindingStatus, eventUrl, factoryAbi, firstTicketPage, formatTime, localText, networks, reader, shortAddress, txUrl, type Chain } from "./chain";
 import { signalConfirmation, usePolling, useWorkshop } from "./useWorkshop";
 import { buy, cancelSponsored, confirm, join, publish, useWallet, walletError, workshopWith, type GetSigner, type Notify, type WalletChoice } from "./wallet";
 import { PendingDelivery, forgetJoin, pendingJoin, readDelivery, sponsorshipStatus } from "./sponsorship";
@@ -40,6 +40,8 @@ function EventPage({ source, account, busy, connect, run, notify, getSigner }: S
   const checkSponsor = Boolean(event?.sponsored && ready && (event.publicSeats === 0 || account));
   const feeStatus = usePolling(useCallback(async () => checkSponsor ? sponsorshipStatus(source) : "checking", [source, checkSponsor]));
   const sponsorship = event?.sponsored === false ? "legacy" : feeStatus.data ?? "checking";
+  const checkCancel = Boolean(checkSponsor && account);
+  const cancelFees = usePolling(useCallback(async () => checkCancel ? sponsorshipStatus(source, "cancel") : "checking", [source, checkCancel]));
   useEffect(() => { document.title = (summary?.name || localText("Event details", "活动详情")) + " · ReSeat"; }, [summary?.name]);
   const snapshot = queue.data;
   const now = Math.max(base.data?.block.timestamp ?? 0, snapshot?.now ?? 0);
@@ -126,11 +128,11 @@ function EventPage({ source, account, busy, connect, run, notify, getSigner }: S
       onPage={next => setTicketPage({ owner: account, cursor: next })}
       onActivate={() => void run(async () => {
         notify("Confirm the activation retry on Base.");
-        const factory = new Contract(contractAddress("base"), factoryAbi, await getSigner());
+        const factory = new Contract(event.binding.factory, factoryAbi, await getSigner());
         return confirm(await factory.retryActivation(source), notify);
       }, "Activation requested again.")}>
         {account && <MyOrders key={account} source={source} account={account} now={now} event={event} busy={busy}
-          orders={orders} queue={snapshot} ranks={ranks} readError={Boolean(queue.error)} sponsorship={sponsorship} cancel={cancel} />}
+          orders={orders} queue={snapshot} ranks={ranks} readError={Boolean(queue.error)} sponsorship={event.sponsored ? cancelFees.data ?? "checking" : "legacy"} cancel={cancel} />}
       </Registration></div></>}
   </>;
 }

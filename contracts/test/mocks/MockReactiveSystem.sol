@@ -3,9 +3,26 @@ pragma solidity ^0.8.29;
 
 import {IReactive} from "@reactive/src/interfaces/IReactive.sol";
 import {ISystemContract} from "@reactive/src/interfaces/ISystemContract.sol";
+import {IPayable} from "@reactive/src/interfaces/IPayable.sol";
+
+abstract contract MockFeeAccounting is IPayable {
+    mapping(address => uint256) public reserves;
+    mapping(address => uint256) public debt;
+
+    function setDebt(address account, uint256 amount) external {
+        debt[account] = amount;
+    }
+
+    function depositTo(address target) external payable {
+        uint256 repaid = msg.value < debt[target] ? msg.value : debt[target];
+        debt[target] -= repaid;
+        reserves[target] += msg.value - repaid;
+    }
+    receive() external payable {}
+}
 
 /// @notice Models filter matching, queued transport and sender injection as separate steps.
-contract MockReactiveSystem is ISystemContract {
+contract MockReactiveSystem is ISystemContract, MockFeeAccounting {
     uint256 private constant IGNORE = 0xa65f96fc951c35ead38878e0f0b7a3c744a6f5ccc1476b313353ce31712313ad;
     mapping(bytes32 => bool) public subscriptions;
     uint256 public adds;
@@ -13,6 +30,7 @@ contract MockReactiveSystem is ISystemContract {
     uint256 public requestCount;
     mapping(uint256 => CallbackConfiguration_V_1_0) private requests;
     mapping(uint256 => address) private senders;
+    event TransportRequested(uint256 indexed index);
 
     function subscribe(uint256 chain, address source, uint256 t0, uint256 t1, uint256 t2, uint256 t3) external {
         bytes32 key = keccak256(abi.encode(msg.sender, chain, source, t0, t1, t2, t3));
@@ -38,6 +56,7 @@ contract MockReactiveSystem is ISystemContract {
     }
 
     function requestCallbackV_1_0(CallbackConfiguration_V_1_0 memory config) external {
+        emit TransportRequested(requestCount);
         requests[requestCount] = config;
         senders[requestCount++] = msg.sender;
     }
@@ -56,28 +75,30 @@ contract MockReactiveSystem is ISystemContract {
         proxy.forward(config.recipient, config.payload, senders[index], config.gasLimit);
     }
 
-    mapping(address => uint256) public reserves;
+    struct Delivery {
+        uint256 blockNumber;
+        address sender;
+        uint256 index;
+        uint256 chainId;
+        uint256 txHash;
+        bytes err;
+    }
+    mapping(uint256 => Delivery[]) private deliveries;
 
-    function depositTo(address target) external payable {
-        reserves[target] += msg.value;
+    function getCallbacks(uint256 hash) external view returns (Delivery[] memory) {
+        return deliveries[hash];
     }
 
-    function debt(address) external pure returns (uint256) {
-        return 0;
+    function recordDelivery(uint256 hash, address sender, uint256 destinationHash) external {
+        deliveries[hash].push(Delivery(block.number, sender, 0, 84532, destinationHash, ""));
     }
-    receive() external payable {}
 }
 
-contract MockCallbackProxy {
-    mapping(address => uint256) public reserves;
+contract MockCallbackProxy is MockFeeAccounting {
     uint256 public deliveryFee;
 
     function setDeliveryFee(uint256 fee) external {
         deliveryFee = fee;
-    }
-
-    function depositTo(address target) external payable {
-        reserves[target] += msg.value;
     }
 
     function forward(address target, bytes memory payload, address sender, uint64 gasLimit) external {
@@ -89,9 +110,4 @@ contract MockCallbackProxy {
         (bool ok, bytes memory result) = target.call{gas: gasLimit}(payload);
         if (!ok) assembly ("memory-safe") { revert(add(result, 32), mload(result)) }
     }
-
-    function debt(address) external pure returns (uint256) {
-        return 0;
-    }
-    receive() external payable {}
 }

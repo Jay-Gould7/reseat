@@ -18,6 +18,8 @@ Joining the waitlist currently requires an externally owned account (EOA), such 
 
 候补目前支持普通钱包账户（EOA），例如 MetaMask 的标准账户。
 
+An EOA with smart-account delegation can join when its current validator accepts the exact signature used by Circle USDC. After signing, the relay simulates `receiveWithAuthorization` on Base Sepolia from the event address with the signed total, deadline and nonce. This spends no funds and leaves the nonce unused. If Circle rejects the signature, switch to a standard wallet account and sign again. The event also verifies order ownership. If a guest changes delegation after joining and Circle explicitly rejects that signature at collection, the next guest gets a turn. A paused token or an unknown collection failure preserves FIFO priority. [Circle's authorization implementation](https://github.com/circlefin/stablecoin-evm/blob/master/contracts/v2/EIP3009.sol) · [Circle's signature checker](https://github.com/circlefin/stablecoin-evm/blob/master/contracts/util/SignatureChecker.sol)
+
 ### Who pays the network fee?
 
 | Action on a sponsorship-enabled event | Fee payer | What the guest does |
@@ -63,6 +65,17 @@ npm run dev
 
 For an existing Chromium installation, set `RESEAT_BROWSER` to its executable path and omit the browser download. The browser tests start two loopback Anvil chains and Vite with temporary wallets and local mocks. They exercise two organizers, sharing into a fresh mobile browser, binding, purchases, signed orders, refunds, recovery after a failed collection and top-ups on both networks. The preceding Foundry run produces their required artifacts. The regular dev server uses the platform settings in the root `.env`.
 
+The zero-ETH browser test gives the guest exactly 2 test USDC. They sign for two 1-USDC tickets and close the page. The first refund leaves their USDC untouched. The second triggers one charge and two tickets, even if the same callback arrives twice. Other browser tests cover concurrent admissions on a nearly depleted reserve, relay restart, rejection before submission, loss of an accepted HTTP response, reverse proxy quotas and old links after a two-factory cutover.
+
+To exercise Circle's deployed USDC and the deployed wallet validators at Base Sepolia block **64300000**, run the following with an archive-capable RPC. The fork uses local balances, event contracts and callback identities. It makes no public transactions.
+
+```sh
+cd contracts
+FOUNDRY_EVM_VERSION=prague RESEAT_FORK_RPC=https://sepolia.base.org forge test --match-contract CircleForkTest -vvv
+```
+
+On that fork a standard EOA and a MetaMask EIP-7702 account delegated to `0x63c0c19a282a1B52b07dD5a65b58948A07DAE32B` both completed collection. With the tested Kernel delegation at `0xd6CEDDe84be40893d153Be9d467CD6aD37875b28`, Circle rejected the raw ReSeat signature. Switching to that delegation after joining also allowed the next order to be paid and issued. Other validator configurations are checked per order at runtime.
+
 ## Deploy the platform once
 
 The addresses in the testnet table belong to the earlier `23e89b3` deployment. Its **0.0001 test ETH** per-event deposit pays for automated callbacks. Its events require wallet transactions for entry and cancellation. The frontend labels these events as wallet-paid. Sponsorship requires a new watcher and factory, and events published through that factory. Event contracts are immutable.
@@ -91,15 +104,41 @@ forge script script/03_BindSource.s.sol:BindSource --rpc-url "$LASNA_RPC_URL" --
 forge script script/04_FundingCommands.s.sol:FundingCommands
 ```
 
-Use the same revision for the watcher, factory and frontend. The automatic payment retry uses an updated settlement event and callback interface. Build the web app with the two platform addresses and their start blocks. The Base start block is the **factory deployment block**. Browser-safe public RPC overrides are `VITE_BASE_RPC_URL` and `VITE_LASNA_RPC_URL`. Later publications are discovered by address using the same web build. The static site supports share links without server-side routing.
+The updated `EventWaitlist` creation code is embedded in `EventFactory`. Deploy a fresh factory and a fresh `WaitlistReactive` instance because each watcher binds to one factory for its lifetime. Keep the existing Circle USDC and Base callback proxy. Set the new `VITE_FACTORY_ADDRESS`, `VITE_REACTIVE_ADDRESS`, `VITE_BASE_START_BLOCK` and `VITE_LASNA_START_BLOCK` to the two deployment receipts and rebuild the frontend. The Base start block is the factory deployment block. Browser-safe RPC overrides are `VITE_BASE_RPC_URL` and `VITE_LASNA_RPC_URL`.
+
+Before switching, keep every trusted former deployment in `VITE_LEGACY_PLATFORMS`. Use the JSON array in `.env.example` and add each old pair's actual factory, watcher and deployment blocks. The directory and publication form use the current factory. An existing `?event=0x…` link resolves its original factory, checks factory membership and the event's callback sender, and reads history from its original watcher. Holders can refund before the start and organizers can withdraw afterwards on the original contract. Old events retain their own funds and on-chain rules. This relay admits requests only for its active factory.
 
 **Run the relay.** Local `npm run dev` and `npm run preview` serve the API next to the app. For production, run `cd web && npm run relay` on the relay host and reverse-proxy the public site's `/api/waitlist/` path to `127.0.0.1:8787`, preserving the original Host header. Serve `web/dist/` for other paths. Use one relay process per signing wallet. The relay host needs the two RPCs, the two public platform addresses and the dedicated relay key. Keep the deployment key off that host. The watcher owner can rotate or disable the signer with `setWaitlistRelay(address)`.
 
-The event form checks the relay, binding and available fee credit before signing. A Lasna transaction means delivery is pending. Base's order state confirms success. The relay checks actual Base signatures, forwards only the two waitlist operations for registered events and spaces repeat requests for the same order by five minutes. If delivery stalls, the original order can be retried using the same nonce. The browser stores the pending order's public terms and salt so a reload can find it. Ordinary MetaMask accounts and signing EOAs with delegated code use the same flow.
+For nginx on the same machine, set `WAITLIST_TRUSTED_PROXIES=127.0.0.1` on the relay. The proxy must overwrite the visitor header on every request. If another trusted ingress sits in front of nginx, configure nginx's real-IP module for that ingress so `$remote_addr` is the verified client IP.
 
-**Funding.** Open **Automation funding** in the footer to see the Lasna watcher's execution credit and outstanding debt, or open **Event funding** from an event page to see its Base callback balance. The platform operator can top up the watcher with Lasna test REACT (lREACT). The host pays Base gas and the factory’s ETH reserve when publishing. The factory credits that event on the Base callback proxy. Anyone can top up its reserve with Base test ETH.
+```nginx
+location /api/waitlist/ {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
 
-The funding page switches the wallet to the selected chain and calls `depositTo` on its fee service. Unused prepaid credit stays on that service after the event starts. The watcher and each event also expose `coverDebt()` for native funds sent directly to the contracts. Ticket refunds and organizer proceeds are paid separately in USDC. [Reactive funding and debt](https://dev.reactive.network/economy)
+The relay accepts a single valid `X-Real-IP` only from the exact socket peers in this comma-separated list. Direct connections use their socket IP. Write limits are 20 per visitor and 120 total per minute. Reads have separate limits of 180 per visitor and 1,200 total per minute.
+
+The form and the serialized admission check use the same on-chain budget. The following server-only settings are native-token wei per unit. Set them from measured fees plus headroom before opening public sponsorship.
+
+| Setting | Default | What it reserves |
+| --- | --- | --- |
+| `WAITLIST_BASE_CALLBACK_WEI` | 0.00001 Base test ETH | One Base callback per pending submission and at least one future settlement per queued or newly admitted order in that event |
+| `WAITLIST_LASNA_TX_WEI` | 0.005 lREACT | Per relay transaction, using the larger of this floor or the forwarding gas limit times the current Lasna fee quote |
+| `WAITLIST_LASNA_EXECUTION_WEI` | 0.01 lREACT | One watcher execution unit for each pending delivery and each reserved settlement across all active-factory events |
+
+Base and watcher checks read native balances, prepaid credit and outstanding debt. Either contract having debt pauses new admissions. Low relay-wallet gas also pauses submissions. Each funding message identifies the account to top up. The page polls again after funding. These thresholds are operator estimates. On-chain fees and the number of retries can vary.
+
+Set `WAITLIST_RELAY_STATE_DIR` to a private persistent directory outside the static site, or use `~/.reseat/relay-state`. Keep one writer per signing wallet and retain this directory across restarts. The relay journals signed transactions before broadcasting and reserves funds through destination confirmation. A Lasna receipt releases the forwarding-gas reservation. The destination allowance stays reserved until Lasna records the callback and Base has its receipt. A queued order continues to reserve settlement funds. An RPC timeout can replay the same signed transaction. If delivery stalls after Lasna confirmation, a later attempt retains the order nonce.
+
+If the service explicitly rejects a first request before broadcasting, the guest can edit the quantity and deadline and sign again. A submitted request or disconnected response keeps its original terms and salt in the browser. Reloading checks Base, and confirmation clears the draft. The browser never stores the signed authorization.
+
+**Funding.** Open **Automation funding** in the footer or **Event funding** on an event page. The three destinations are the event's Base callback reserve, the platform's Lasna execution credit and the authorized relay wallet's Lasna gas balance. The host funds the event when publishing. The platform operator funds the watcher and relay. Anyone can top up the displayed destinations.
+
+The funding page switches to the selected chain. It calls `depositTo` for event and watcher credit and sends a native transfer for the relay wallet read from the watcher. Unused prepaid credit stays on the fee service after the event starts. The watcher and each event also expose `coverDebt()` for native funds sent directly to the contracts. Ticket refunds and organizer proceeds are paid separately in USDC. [Reactive funding and debt](https://dev.reactive.network/economy)
 
 **Recovery.** A host can replay the factory announcement on Base after five minutes if activation stalls. After Base confirmation one additional replay can repair a lost initial snapshot. After the third automatic payment request, the watcher keeps the deadline timer. A retry due at or after the deadline is omitted. A refund that only partially covers the head waits for more seats or expiry. When a replay is available, the organizer can open **Organizer tools** and select **Resend waitlist status**. This Base transaction costs gas and republishes the state to Lasna. The contract’s `requestSettlementRetry()` remains publicly callable. Each distinct head, inventory, observed payment state and processed payment attempt allows one replay. Empty or repeatedly unchanged requests revert before emitting a new report. After restoring funding, the watcher owner can call `syncEvent(eventAddress)` on Lasna for a registered event when repeated deliveries have failed. Only authenticated callbacks can settle orders.
 
